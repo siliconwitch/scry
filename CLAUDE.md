@@ -55,15 +55,22 @@ General and meant to be reused verbatim across projects.
   holds no application logic.
 - **Packages point downward.** `tui` imports `mailbox`, `viewer` and `synclog`.
   Those three never import each other or `tui`. `viewer` defines its own `Page`
-  type, so it knows nothing about mail.
-  - `mailbox`: accounts, messages, folder actions and search.
+  type, so it knows nothing about mail. `mailbox` imports `imapsync` and
+  `mirror`, which import nothing from scry.
+  - `mailbox`: accounts, messages, folder actions, search, and the sync that
+    decides which folders, how much history and which images to fetch.
+  - `imapsync`: IMAP login, folder roles, batched search, flags and fetch, and
+    MIME parsing.
+  - `mirror`: encrypted files on disk, keyed from the account password.
   - `viewer`: the local HTTP server and the browser page.
   - `synclog`: daily log files and their retention.
   - `tui`: every screen, key and click.
 - **The Elm Architecture (Bubble Tea v2).** State lives in the model,
   transitions happen in `Update`, side effects are `Cmd`s. Never block in
-  `Update` and never spawn goroutines from the TUI. The viewer's HTTP server is
-  the one goroutine, started from `main.go`, with its state behind a mutex.
+  `Update` and never spawn goroutines from the TUI. Loading an email's body
+  from the mirror is a `Cmd`. The viewer's HTTP server runs in its own
+  goroutine, started from `main.go`, with its state behind a mutex. Sync
+  downloads images for up to 8 emails at once.
 - **One path for keys and clicks.** Every clickable element is a bubblezone
   `key:<key>` zone, and a click calls `handleKey` with that key. Add a new
   action as a key first, then render it with `button`, and the click comes for
@@ -103,19 +110,32 @@ General and meant to be reused verbatim across projects.
 
 ## Project state
 
-The UI runs on sample mail from `mailbox.Sample`. `main.go` reads only `viewer`
-and `log-days` from `~/.config/scry/config.toml` and ignores the account
-blocks. Sync and send are stand-ins that wait and succeed.
+`main.go` loads the `[[account]]` blocks in file order and exits when there
+are none. `mailbox.New` adds Inbox, Sent, Archive, Spam and Trash ahead of each
+account's configured folders. There is no sample mail.
+
+Sync mirrors each account into `~/.local/state/scry/mirror/<hash of email>`.
+It runs `password-cmd` once per session and keeps the password in memory.
+Archive and Sent keep `history-days` (default 365). Other folders are mirrored
+in full. Archive is the server's `\Archive` folder, otherwise one named
+`Archive`. Remote images are inlined as `data:` URIs, never for Spam and never
+from private, loopback or CGNAT addresses. Reading marks the email read on the
+server at the next sync. Moving and sending return an error until they are
+built.
+
+Sync runs in two passes. The first logs in to every account, applies flag
+changes and removals, and counts the emails to download. The second downloads
+them. `SyncProgress` returns the downloaded and total counts for the
+percentage beside the logo, and each folder writes its counts to the sync log.
+The index is saved after every batch of downloads.
 
 Next, in rough order:
 
-1. Load accounts from the config in file order.
-2. IMAP sync into an encrypted local mirror, keyed from each account's
-   password, including remote images. Encryption must stay pure Go.
-3. The offline action queue with its server-side check.
-4. SMTP sending, the Markdown subset to HTML, and HTML signatures.
-5. Email details and attachments in the viewer page.
-6. Release setup for the AUR and Nix, following battui.
+1. The offline action queue with its server-side check, including persisting
+   pending reads across restarts.
+2. SMTP sending, the Markdown subset to HTML, and HTML signatures.
+3. Email details and attachments in the viewer page.
+4. Release setup for the AUR and Nix, following battui.
 
 ## Maintenance
 

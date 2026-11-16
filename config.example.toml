@@ -6,3 +6,7 @@ viewer = "chromium --app=%s"
 
 # Days to keep sync logs in ~/.local/state/scry/logs.
 log-days = 7
+
+# Days of Archive and Sent to keep on this machine. Older mail stays on the
+# server and doesn't appear in scry.
+history-days = 365

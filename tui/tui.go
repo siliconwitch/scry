@@ -55,7 +55,15 @@ type folderRow struct {
 
 type syncDoneMsg struct{ err error }
 
+type syncProgressMsg struct{}
+
 type sendDoneMsg struct{ err error }
+
+type bodyLoadedMsg struct {
+	id      string
+	message mailbox.Message
+	err     error
+}
 
 type sendTickMsg struct{ generation int }
 
@@ -163,13 +171,12 @@ func New(options Options) *Model {
 	}
 
 	m.reload()
-	m.showSelected()
 
 	return m
 }
 
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(tea.RequestBackgroundColor, m.startSync())
+	return tea.Batch(tea.RequestBackgroundColor, m.startSync(), m.showSelected())
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -196,16 +203,60 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
 
+	case syncProgressMsg:
+		if m.networkActive == 0 {
+			return m, nil
+		}
+
+		m.reload()
+
+		return m, tea.Batch(m.showSelected(), tea.Tick(2*time.Second, func(time.Time) tea.Msg { return syncProgressMsg{} }))
+
 	case syncDoneMsg:
 		if msg.err != nil {
-			m.options.Log.Write("Sync failed: %v", msg.err)
+			for _, line := range strings.Split(msg.err.Error(), "\n") {
+				m.options.Log.Write("Sync failed: %s", line)
+			}
 		} else {
 			m.options.Log.Write("Sync finished")
 		}
 
 		m.reload()
-		m.showSelected()
 		m.finishNetwork(msg.err)
+
+		return m, m.showSelected()
+
+	case bodyLoadedMsg:
+		if msg.id != m.shownID {
+			return m, nil
+		}
+
+		recipients := []viewer.Address{}
+		for _, recipient := range msg.message.To {
+			recipients = append(recipients, viewer.Address{Name: recipient.Name, Email: recipient.Email})
+		}
+
+		var attachments []viewer.Attachment
+		for _, attachment := range msg.message.Attachments {
+			attachments = append(attachments, viewer.Attachment{Name: attachment.Name, Data: attachment.Data})
+		}
+
+		m.options.Viewer.Show(viewer.Page{
+			ID:           msg.message.ID,
+			Subject:      msg.message.Subject,
+			From:         viewer.Address{Name: msg.message.From.Name, Email: msg.message.From.Email},
+			To:           recipients,
+			Date:         msg.message.Date.Format("Mon 2 Jan 2006, 15:04"),
+			HTML:         msg.message.HTML,
+			Text:         msg.message.Text,
+			Attachments:  attachments,
+			AccountLight: m.accountColor(msg.message.Account).Light,
+			AccountDark:  m.accountColor(msg.message.Account).Dark,
+		})
+
+		if msg.err != nil {
+			return m, m.setNotice("Can't open this email: " + msg.err.Error())
+		}
 
 		return m, nil
 
@@ -334,8 +385,7 @@ func (m *Model) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.messageIndex = 0
 		m.listOffset = 0
 		m.reload()
-		m.showSelected()
-		return m, nil
+		return m, m.showSelected()
 
 	case "enter", "tab":
 		m.search.Blur()
@@ -361,7 +411,7 @@ func (m *Model) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.messageIndex = 0
 		m.listOffset = 0
 		m.reload()
-		m.showSelected()
+		cmd = tea.Batch(cmd, m.showSelected())
 	}
 
 	return m, cmd
@@ -412,7 +462,7 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case logPopup:
-		visibleLines := max(1, m.panesHeight()-4)
+		visibleLines := m.logRows()
 
 		switch key {
 		case "j", "down":
@@ -456,7 +506,7 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 
 	case "L":
 		m.logLines = m.options.Log.Lines()
-		m.logOffset = max(0, len(m.logLines)-max(1, m.panesHeight()-4))
+		m.logOffset = max(0, len(m.logLines)-m.logRows())
 		m.popup = logPopup
 		return m, nil
 
@@ -534,20 +584,19 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 		step := map[string]int{"j": 1, "down": 1, "k": -1, "up": -1, "pgdown": m.listRows(), "pgup": -m.listRows(), "home": -1 << 30, "end": 1 << 30}[key]
 
 		if m.focus == folderPane {
-			m.selectFolder(m.folderIndex + step)
-			return m, nil
+			return m, m.selectFolder(m.folderIndex + step)
 		}
 
 		m.messageIndex = max(0, min(m.messageIndex+step, len(m.messages)-1))
 		m.clampList()
-		m.showSelected()
+		return m, m.showSelected()
 
 	case "esc":
 		if m.search.Value() != "" {
 			m.search.SetValue("")
 			m.messageIndex = 0
 			m.reload()
-			m.showSelected()
+			return m, m.showSelected()
 		}
 
 	case "A":
@@ -661,8 +710,7 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if m.zones.Get(fmt.Sprintf("folder:%d", i)).InBounds(msg) {
 			m.focus = folderPane
 			m.draftVisible = false
-			m.selectFolder(i)
-			return m, nil
+			return m, m.selectFolder(i)
 		}
 	}
 
@@ -670,15 +718,14 @@ func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if m.zones.Get(fmt.Sprintf("message:%d", i)).InBounds(msg) {
 			m.focus = listPane
 			m.messageIndex = i
-			m.showSelected()
-			return m, nil
+			return m, m.showSelected()
 		}
 	}
 
 	return m, nil
 }
 
-func (m *Model) selectFolder(index int) {
+func (m *Model) selectFolder(index int) tea.Cmd {
 	m.folderIndex = max(0, min(index, len(m.folderRows)-1))
 
 	if m.search.Value() != "" {
@@ -688,7 +735,8 @@ func (m *Model) selectFolder(index int) {
 	m.messageIndex = 0
 	m.listOffset = 0
 	m.reload()
-	m.showSelected()
+
+	return m.showSelected()
 }
 
 func (m *Model) reload() {
@@ -722,7 +770,7 @@ func (m *Model) selected() (mailbox.Message, bool) {
 	return m.messages[m.messageIndex], true
 }
 
-func (m *Model) showSelected() {
+func (m *Model) showSelected() tea.Cmd {
 	message, ok := m.selected()
 
 	if !ok {
@@ -731,41 +779,25 @@ func (m *Model) showSelected() {
 			m.shownID = ""
 		}
 
-		return
+		return nil
 	}
 
 	if message.ID == m.shownID {
-		return
+		return nil
 	}
-
-	recipients := []viewer.Address{}
-	for _, recipient := range message.To {
-		recipients = append(recipients, viewer.Address{Name: recipient.Name, Email: recipient.Email})
-	}
-
-	var attachments []viewer.Attachment
-	for _, attachment := range message.Attachments {
-		attachments = append(attachments, viewer.Attachment{Name: attachment.Name, Data: attachment.Data})
-	}
-
-	m.options.Viewer.Show(viewer.Page{
-		ID:           message.ID,
-		Subject:      message.Subject,
-		From:         viewer.Address{Name: message.From.Name, Email: message.From.Email},
-		To:           recipients,
-		Date:         message.Date.Format("Mon 2 Jan 2006, 15:04"),
-		HTML:         message.HTML,
-		Text:         message.Text,
-		Attachments:  attachments,
-		AccountLight: m.accountColor(message.Account).Light,
-		AccountDark:  m.accountColor(message.Account).Dark,
-	})
 
 	m.shownID = message.ID
 
 	if message.Unread {
 		m.options.Mail.MarkRead(message.ID)
 		m.reload()
+	}
+
+	mail := m.options.Mail
+
+	return func() tea.Msg {
+		loaded, err := mail.Load(message.ID)
+		return bodyLoadedMsg{id: message.ID, message: loaded, err: err}
 	}
 }
 
@@ -788,9 +820,8 @@ func (m *Model) moveSelected(folder string) tea.Cmd {
 	m.options.Log.Write("Moved a message to %s in %s", folder, message.Account)
 
 	m.reload()
-	m.showSelected()
 
-	return m.setNotice("Moved to " + folder)
+	return tea.Batch(m.showSelected(), m.setNotice("Moved to "+folder))
 }
 
 func (m *Model) requestCompose(replyID string, replyAll bool) tea.Cmd {
@@ -912,13 +943,16 @@ func (m *Model) startSync() tea.Cmd {
 	m.options.Log.Write("Sync started")
 
 	mail := m.options.Mail
+	log := m.options.Log
 
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	sync := func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
 
-		return syncDoneMsg{err: mail.Sync(ctx)}
+		return syncDoneMsg{err: mail.Sync(ctx, log.Write)}
 	}
+
+	return tea.Batch(sync, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return syncProgressMsg{} }))
 }
 
 func (m *Model) finishNetwork(err error) {
@@ -946,6 +980,10 @@ func (m *Model) setNotice(text string) tea.Cmd {
 
 func (m *Model) panesHeight() int {
 	return max(3, m.height-3)
+}
+
+func (m *Model) logRows() int {
+	return max(1, min(12, m.panesHeight()-6))
 }
 
 func (m *Model) listRows() int {
@@ -1007,8 +1045,7 @@ func (m *Model) View() tea.View {
 		middle = overlay(middle, m.popupBox(lines, max(lipgloss.Width(question)+4, 34)))
 
 	case logPopup:
-		boxWidth := m.width - 8
-		visibleLines := max(1, panesHeight-4)
+		boxWidth := min(m.width-8, 110)
 
 		lines := []string{
 			boldStyle.Render("Sync log") + m.style(mutedColor).Render("  "+m.options.LogDirectory),
@@ -1020,7 +1057,7 @@ func (m *Model) View() tea.View {
 			lines = append(lines, m.style(mutedColor).Render("Nothing logged yet."))
 		}
 
-		for _, line := range m.logLines[m.logOffset:min(len(m.logLines), m.logOffset+visibleLines-2)] {
+		for _, line := range m.logLines[m.logOffset:min(len(m.logLines), m.logOffset+m.logRows())] {
 			lines = append(lines, fit(line, boxWidth-4))
 		}
 
@@ -1043,6 +1080,10 @@ func (m *Model) topBar() string {
 	}
 
 	title := " " + m.zones.Mark("key:L", m.style(statusColor).Render("◉")) + m.style(accentColor).Bold(true).Render(" scry ")
+
+	if done, total := m.options.Mail.SyncProgress(); m.networkActive > 0 && total > 0 {
+		title += m.style(yellowColor).Render(fmt.Sprintf("%d%% ", done*100/total))
+	}
 
 	searchWidth := min(48, m.width/2)
 

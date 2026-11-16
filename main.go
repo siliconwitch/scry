@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/BurntSushi/toml"
@@ -20,8 +19,18 @@ import (
 )
 
 type config struct {
-	Viewer  string `toml:"viewer"`
-	LogDays int    `toml:"log-days"`
+	Viewer      string          `toml:"viewer"`
+	LogDays     int             `toml:"log-days"`
+	HistoryDays int             `toml:"history-days"`
+	Accounts    []accountConfig `toml:"account"`
+}
+
+type accountConfig struct {
+	Name            string   `toml:"name"`
+	Email           string   `toml:"email"`
+	IMAP            string   `toml:"imap"`
+	PasswordCommand string   `toml:"password-cmd"`
+	Folders         []string `toml:"folders"`
 }
 
 func main() {
@@ -44,13 +53,24 @@ func main() {
 		configPath = filepath.Join(configDirectory, "scry", "config.toml")
 	}
 
-	settings := config{LogDays: 7}
+	settings := config{LogDays: 7, HistoryDays: 365}
 
 	_, err = toml.DecodeFile(configPath, &settings)
 
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		fmt.Fprintln(os.Stderr, "scry: reading config:", err)
 		os.Exit(1)
+	}
+
+	if len(settings.Accounts) == 0 {
+		fmt.Fprintln(os.Stderr, "scry: no [[account]] blocks in", configPath)
+		os.Exit(1)
+	}
+
+	var accounts []mailbox.Account
+
+	for _, account := range settings.Accounts {
+		accounts = append(accounts, mailbox.Account{Name: account.Name, Email: account.Email, IMAP: account.IMAP, PasswordCommand: account.PasswordCommand, Folders: account.Folders})
 	}
 
 	stateDirectory := os.Getenv("XDG_STATE_HOME")
@@ -92,7 +112,7 @@ func main() {
 	}
 
 	root := tui.New(tui.Options{
-		Mail:         mailbox.Sample(time.Now()),
+		Mail:         mailbox.New(accounts, filepath.Join(stateDirectory, "scry", "mirror"), settings.HistoryDays),
 		Viewer:       server,
 		Log:          log,
 		LogDirectory: logDirectory,
