@@ -403,6 +403,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.networkActive++
 
 		draft := *m.draft
+		draft.Attach = nil
+
+		for _, path := range m.draft.Attach {
+			draft.Attach = append(draft.Attach, expandHome(path))
+		}
+
 		mail := m.options.Mail
 
 		return m, func() tea.Msg { return sendDoneMsg{err: mail.Send(draft)} }

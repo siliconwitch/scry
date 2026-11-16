@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/gob"
 	"errors"
@@ -15,6 +16,8 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/smtp"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -23,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/emersion/go-message/mail"
 	"golang.org/x/net/html"
 	"golang.org/x/sync/errgroup"
 
@@ -76,6 +80,8 @@ type Message struct {
 	To           []Address
 	Subject      string
 	Date         time.Time
+	MessageID    string
+	References   []string
 	Unread       bool
 	Text         string
 	HTML         string
@@ -87,6 +93,8 @@ type Account struct {
 	Name            string
 	Email           string
 	IMAP            string
+	SMTP            string
+	Signature       string
 	PasswordCommand string
 	Folders         []string
 }
@@ -939,6 +947,8 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 								From:         Address{Name: fetched.From.Name, Email: fetched.From.Email},
 								Subject:      fetched.Subject,
 								Date:         fetched.Date,
+								MessageID:    fetched.MessageID,
+								References:   fetched.References,
 								Unread:       !fetched.Seen,
 								Text:         fetched.Text,
 								UID:          fetched.UID,
@@ -1071,5 +1081,299 @@ func bodyFile(id string) string {
 }
 
 func (b *Mailbox) Send(draft Draft) error {
-	return errors.New("sending isn't built yet")
+	account, ok := b.Account(draft.Account)
+
+	if !ok {
+		return fmt.Errorf("no account called %s", draft.Account)
+	}
+
+	b.mutex.Lock()
+	opened := b.opened[account.Name]
+	b.mutex.Unlock()
+
+	if opened == nil {
+		return errors.New("scry hasn't unlocked this account yet. Press Ctrl+R to sync it")
+	}
+
+	recipients, err := mail.ParseAddressList(draft.To)
+
+	if err != nil {
+		return fmt.Errorf("reading the To line: %w", err)
+	}
+
+	_, domain, _ := strings.Cut(account.Email, "@")
+
+	var header mail.Header
+
+	header.SetDate(time.Now())
+	header.SetAddressList("From", []*mail.Address{{Address: account.Email}})
+	header.SetAddressList("To", recipients)
+	header.SetSubject(draft.Subject)
+
+	err = header.GenerateMessageIDWithHostname(domain)
+
+	if err != nil {
+		return err
+	}
+
+	original, ok := b.Get(draft.ReplyTo)
+
+	if ok && original.MessageID != "" {
+		header.SetMsgIDList("In-Reply-To", []string{original.MessageID})
+		header.SetMsgIDList("References", append(slices.Clone(original.References), original.MessageID))
+	}
+
+	var rendered strings.Builder
+
+	block := ""
+
+	for _, line := range strings.Split(draft.Body, "\n") {
+		item, isItem := strings.CutPrefix(line, "- ")
+
+		kind := "p"
+		text := line
+
+		switch {
+		case strings.TrimSpace(line) == "":
+			kind = ""
+
+		case isItem:
+			kind = "ul"
+			text = item
+		}
+
+		if kind != block && block != "" {
+			rendered.WriteString("</" + block + ">")
+		}
+
+		if kind != block && kind != "" {
+			rendered.WriteString("<" + kind + ">")
+		}
+
+		if kind == block && kind == "p" {
+			rendered.WriteString("<br>")
+		}
+
+		block = kind
+
+		if kind == "" {
+			continue
+		}
+
+		parts := strings.Split(html.EscapeString(text), "**")
+
+		var inline strings.Builder
+
+		for i, part := range parts {
+			switch {
+			case i == 0:
+
+			case i%2 == 1 && i == len(parts)-1:
+				inline.WriteString("**")
+
+			case i%2 == 1:
+				inline.WriteString("<strong>")
+
+			default:
+				inline.WriteString("</strong>")
+			}
+
+			inline.WriteString(part)
+		}
+
+		if kind == "ul" {
+			rendered.WriteString("<li>" + inline.String() + "</li>")
+			continue
+		}
+
+		rendered.WriteString(inline.String())
+	}
+
+	if block != "" {
+		rendered.WriteString("</" + block + ">")
+	}
+
+	plainText := draft.Body
+	htmlText := rendered.String()
+
+	if account.Signature != "" {
+		signature, err := os.ReadFile(account.Signature)
+
+		if err != nil {
+			return fmt.Errorf("reading the signature: %w", err)
+		}
+
+		plainText += "\n\n" + imapsync.PlainText(string(signature))
+		htmlText += string(signature)
+	}
+
+	var encoded bytes.Buffer
+
+	writer, err := mail.CreateWriter(&encoded, header)
+
+	if err != nil {
+		return err
+	}
+
+	alternatives, err := writer.CreateInline()
+
+	if err != nil {
+		return err
+	}
+
+	for _, part := range []struct{ contentType, content string }{{"text/plain", plainText}, {"text/html", htmlText}} {
+		var partHeader mail.InlineHeader
+
+		partHeader.SetContentType(part.contentType, map[string]string{"charset": "utf-8"})
+
+		partWriter, err := alternatives.CreatePart(partHeader)
+
+		if err != nil {
+			return err
+		}
+
+		_, err = io.WriteString(partWriter, part.content)
+
+		if err != nil {
+			return err
+		}
+
+		err = partWriter.Close()
+
+		if err != nil {
+			return err
+		}
+	}
+
+	err = alternatives.Close()
+
+	if err != nil {
+		return err
+	}
+
+	for _, path := range draft.Attach {
+		content, err := os.ReadFile(path)
+
+		if err != nil {
+			return fmt.Errorf("reading the attachment %s: %w", filepath.Base(path), err)
+		}
+
+		contentType := mime.TypeByExtension(filepath.Ext(path))
+
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+
+		var attachmentHeader mail.AttachmentHeader
+
+		attachmentHeader.Set("Content-Type", contentType)
+		attachmentHeader.SetFilename(filepath.Base(path))
+
+		attachmentWriter, err := writer.CreateAttachment(attachmentHeader)
+
+		if err != nil {
+			return err
+		}
+
+		_, err = attachmentWriter.Write(content)
+
+		if err != nil {
+			return err
+		}
+
+		err = attachmentWriter.Close()
+
+		if err != nil {
+			return err
+		}
+	}
+
+	err = writer.Close()
+
+	if err != nil {
+		return err
+	}
+
+	host, port, err := net.SplitHostPort(account.SMTP)
+
+	if err != nil {
+		return fmt.Errorf("reading the smtp address: %w", err)
+	}
+
+	tlsConfig := &tls.Config{ServerName: host}
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+
+	var connection net.Conn
+
+	if port == "465" {
+		connection, err = tls.DialWithDialer(dialer, "tcp", account.SMTP, tlsConfig)
+	} else {
+		connection, err = dialer.Dial("tcp", account.SMTP)
+	}
+
+	if err != nil {
+		return fmt.Errorf("connecting to the smtp server: %w", err)
+	}
+
+	connection.SetDeadline(time.Now().Add(5 * time.Minute))
+
+	client, err := smtp.NewClient(connection, host)
+
+	if err != nil {
+		connection.Close()
+		return fmt.Errorf("connecting to the smtp server: %w", err)
+	}
+
+	defer client.Close()
+
+	if port != "465" {
+		err = client.StartTLS(tlsConfig)
+
+		if err != nil {
+			return fmt.Errorf("starting TLS: %w", err)
+		}
+	}
+
+	err = client.Auth(smtp.PlainAuth("", account.Email, opened.password, host))
+
+	if err != nil {
+		return fmt.Errorf("signing in: %w", err)
+	}
+
+	err = client.Mail(account.Email)
+
+	if err != nil {
+		return err
+	}
+
+	for _, recipient := range recipients {
+		err = client.Rcpt(recipient.Address)
+
+		if err != nil {
+			return fmt.Errorf("the server refused %s: %w", recipient.Address, err)
+		}
+	}
+
+	data, err := client.Data()
+
+	if err != nil {
+		return err
+	}
+
+	_, err = data.Write(encoded.Bytes())
+
+	if err != nil {
+		return err
+	}
+
+	err = data.Close()
+
+	if err != nil {
+		return err
+	}
+
+	// The server has accepted the email once DATA ends, so a failed QUIT must not report a failed send.
+	client.Quit()
+
+	return nil
 }

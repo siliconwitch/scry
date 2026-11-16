@@ -111,7 +111,8 @@ General and meant to be reused verbatim across projects.
 ## Project state
 
 `main.go` loads the `[[account]]` blocks in file order and exits when there
-are none. `mailbox.New` adds Inbox, Sent, Archive, Spam and Trash ahead of each
+are none or when two share an email, since the mirror is keyed by email.
+`mailbox.New` adds Inbox, Sent, Archive, Spam and Trash ahead of each
 account's configured folders. There is no sample mail.
 
 Sync mirrors each account into `~/.local/state/scry/mirror/<hash of email>`.
@@ -119,8 +120,16 @@ It runs `password-cmd` once per session and keeps the password in memory.
 Archive and Sent keep `history-days` (default 365). Other folders are mirrored
 in full. Archive is the server's `\Archive` folder, otherwise one named
 `Archive`. Remote images are inlined as `data:` URIs, never for Spam and never
-from private, loopback or CGNAT addresses. Sending returns an error until it
-is built.
+from private, loopback or CGNAT addresses. Sync stores each email's
+`Message-ID` and `References` for reply threading. Emails mirrored before that
+have neither, so replies to them don't thread.
+
+`mailbox.Send` sends over SMTP with the password from the last sync, so an
+account must have synced this session. Port 465 uses TLS and other ports
+require STARTTLS. It sends multipart/alternative: the body as written, and HTML
+from the Markdown subset, with the signature file appended to both. The
+signature's plain-text version comes from `imapsync.PlainText`. scry doesn't
+upload a copy to Sent, because the server files sent mail there itself.
 
 Reading and moving change only the local mirror. A message's `Folder` is where
 scry shows it and `ServerFolder` is where the server holds it, so a pending
@@ -140,9 +149,8 @@ seconds and once more when each account finishes.
 
 Next, in rough order:
 
-1. SMTP sending, the Markdown subset to HTML, and HTML signatures.
-2. Email details and attachments in the viewer page.
-3. Release setup for the AUR and Nix, following battui.
+1. Email details and attachments in the viewer page.
+2. Release setup for the AUR and Nix, following battui.
 
 ## Maintenance
 

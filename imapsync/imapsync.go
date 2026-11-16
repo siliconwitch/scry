@@ -43,6 +43,8 @@ type Fetched struct {
 	To          []Address
 	Subject     string
 	Date        time.Time
+	MessageID   string
+	References  []string
 	Text        string
 	HTML        string
 	Attachments []Attachment
@@ -265,6 +267,8 @@ func (s *Session) Fetch(uids []uint32, deliver func([]Fetched) error) error {
 
 			fetched.Subject, _ = reader.Header.Subject()
 			fetched.Date, _ = reader.Header.Date()
+			fetched.MessageID, _ = reader.Header.MessageID()
+			fetched.References, _ = reader.Header.MsgIDList("References")
 
 			from, _ := reader.Header.AddressList("From")
 
@@ -337,35 +341,7 @@ func (s *Session) Fetch(uids []uint32, deliver func([]Fetched) error) error {
 			}
 
 			if fetched.Text == "" && fetched.HTML != "" {
-				tokenizer := html.NewTokenizer(strings.NewReader(fetched.HTML))
-				var text strings.Builder
-				skipping := ""
-
-				for {
-					tokenType := tokenizer.Next()
-
-					if tokenType == html.ErrorToken {
-						break
-					}
-
-					token := tokenizer.Token()
-
-					switch {
-					case tokenType == html.StartTagToken && (token.Data == "script" || token.Data == "style" || token.Data == "head"):
-						skipping = token.Data
-
-					case tokenType == html.EndTagToken && token.Data == skipping:
-						skipping = ""
-
-					case tokenType == html.TextToken && skipping == "":
-						text.WriteString(token.Data)
-
-					case tokenType == html.StartTagToken && (token.Data == "br" || token.Data == "p" || token.Data == "div" || token.Data == "tr" || token.Data == "li"):
-						text.WriteString("\n")
-					}
-				}
-
-				fetched.Text = strings.TrimSpace(text.String())
+				fetched.Text = PlainText(fetched.HTML)
 			}
 
 			if fetched.Date.IsZero() {
@@ -383,6 +359,38 @@ func (s *Session) Fetch(uids []uint32, deliver func([]Fetched) error) error {
 	}
 
 	return nil
+}
+
+func PlainText(document string) string {
+	tokenizer := html.NewTokenizer(strings.NewReader(document))
+	var text strings.Builder
+	skipping := ""
+
+	for {
+		tokenType := tokenizer.Next()
+
+		if tokenType == html.ErrorToken {
+			break
+		}
+
+		token := tokenizer.Token()
+
+		switch {
+		case tokenType == html.StartTagToken && (token.Data == "script" || token.Data == "style" || token.Data == "head"):
+			skipping = token.Data
+
+		case tokenType == html.EndTagToken && token.Data == skipping:
+			skipping = ""
+
+		case tokenType == html.TextToken && skipping == "":
+			text.WriteString(token.Data)
+
+		case tokenType == html.StartTagToken && (token.Data == "br" || token.Data == "p" || token.Data == "div" || token.Data == "tr" || token.Data == "li"):
+			text.WriteString("\n")
+		}
+	}
+
+	return strings.TrimSpace(text.String())
 }
 
 func uidSet(uids []uint32) imap.UIDSet {

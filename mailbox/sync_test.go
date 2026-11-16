@@ -92,6 +92,8 @@ func TestSync(t *testing.T) {
 To: me@example.com
 Subject: Saturday walk?
 Date: `+now.Format(time.RFC1123Z)+`
+Message-ID: <walk@example.com>
+References: <plan@example.com>
 Content-Type: text/plain; charset=utf-8
 
 Meet at the bridge car park.
@@ -204,6 +206,12 @@ See you there.
 					if got != want {
 						t.Errorf("%s: got %q, want %q", folder, got, want)
 					}
+				}
+
+				walk := mail.Folder("Personal", Inbox)[0]
+
+				if walk.MessageID != "walk@example.com" || strings.Join(walk.References, " ") != "plan@example.com" {
+					t.Errorf("threading headers: got %q and %q", walk.MessageID, walk.References)
 				}
 
 				done, total := mail.SyncProgress()

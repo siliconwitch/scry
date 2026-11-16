@@ -29,6 +29,8 @@ type accountConfig struct {
 	Name            string   `toml:"name"`
 	Email           string   `toml:"email"`
 	IMAP            string   `toml:"imap"`
+	SMTP            string   `toml:"smtp"`
+	Signature       string   `toml:"signature"`
 	PasswordCommand string   `toml:"password-cmd"`
 	Folders         []string `toml:"folders"`
 }
@@ -70,8 +72,27 @@ func main() {
 
 	var accounts []mailbox.Account
 
+	accountByEmail := map[string]string{}
+
 	for _, account := range settings.Accounts {
-		accounts = append(accounts, mailbox.Account{Name: account.Name, Email: account.Email, IMAP: account.IMAP, PasswordCommand: account.PasswordCommand, Folders: account.Folders})
+		email := strings.ToLower(account.Email)
+		existing, duplicate := accountByEmail[email]
+
+		if duplicate {
+			fmt.Fprintf(os.Stderr, "scry: %s and %s both use %s. Each account needs its own email.\n", existing, account.Name, account.Email)
+			os.Exit(1)
+		}
+
+		accountByEmail[email] = account.Name
+
+		signature := account.Signature
+		rest, inHome := strings.CutPrefix(signature, "~/")
+
+		if inHome {
+			signature = filepath.Join(home, rest)
+		}
+
+		accounts = append(accounts, mailbox.Account{Name: account.Name, Email: account.Email, IMAP: account.IMAP, SMTP: account.SMTP, Signature: signature, PasswordCommand: account.PasswordCommand, Folders: account.Folders})
 	}
 
 	stateDirectory := os.Getenv("XDG_STATE_HOME")
