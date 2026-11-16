@@ -59,6 +59,8 @@ type syncProgressMsg struct{}
 
 type sendDoneMsg struct{ err error }
 
+type savedMsg struct{ err error }
+
 type bodyLoadedMsg struct {
 	id      string
 	message mailbox.Message
@@ -341,6 +343,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.reload()
 
 		return m, m.showSelected()
+
+	case savedMsg:
+		if msg.err == nil {
+			return m, nil
+		}
+
+		m.options.Log.Write("Save failed: %s", msg.err)
+
+		return m, m.setNotice(msg.err.Error())
 
 	case bodyLoadedMsg:
 		if msg.id != m.shownID {
@@ -799,17 +810,21 @@ func (m *Model) showSelected() tea.Cmd {
 
 	m.shownID = message.ID
 
-	if message.Unread {
-		m.options.Mail.MarkRead(message.ID)
-		m.reload()
-	}
-
 	mail := m.options.Mail
 
-	return func() tea.Msg {
+	load := func() tea.Msg {
 		loaded, err := mail.Load(message.ID)
 		return bodyLoadedMsg{id: message.ID, message: loaded, err: err}
 	}
+
+	if !message.Unread {
+		return load
+	}
+
+	mail.MarkRead(message.ID)
+	m.reload()
+
+	return tea.Batch(load, func() tea.Msg { return savedMsg{err: mail.Save()} })
 }
 
 func (m *Model) moveSelected(folder string) tea.Cmd {
@@ -833,7 +848,9 @@ func (m *Model) moveSelected(folder string) tea.Cmd {
 
 	m.reload()
 
-	return tea.Batch(m.showSelected(), m.setNotice("Moved to "+folder))
+	mail := m.options.Mail
+
+	return tea.Batch(m.showSelected(), m.setNotice("Moved to "+folder), func() tea.Msg { return savedMsg{err: mail.Save()} })
 }
 
 func (m *Model) requestCompose(replyID string, replyAll bool) tea.Cmd {

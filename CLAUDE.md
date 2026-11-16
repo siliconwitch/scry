@@ -119,24 +119,30 @@ It runs `password-cmd` once per session and keeps the password in memory.
 Archive and Sent keep `history-days` (default 365). Other folders are mirrored
 in full. Archive is the server's `\Archive` folder, otherwise one named
 `Archive`. Remote images are inlined as `data:` URIs, never for Spam and never
-from private, loopback or CGNAT addresses. Reading marks the email read on the
-server at the next sync. Moving and sending return an error until they are
-built.
+from private, loopback or CGNAT addresses. Sending returns an error until it
+is built.
 
-Sync runs in two passes. The first logs in to every account, applies flag
-changes and removals, and counts the emails to download. The second downloads
-them. `SyncProgress` returns the downloaded and total counts for the
-percentage beside the logo, and each folder writes its counts to the sync log.
-While downloading, the index is saved at most every 30 seconds and once
-more when each account finishes.
+Reading and moving change only the local mirror. A message's `Folder` is where
+scry shows it and `ServerFolder` is where the server holds it, so a pending
+move is `Folder != ServerFolder`. Pending reads are saved in the index. The TUI
+saves the index after each read or move, and `main.go` saves it again on exit.
+A message keeps its ID when it moves.
+
+Sync runs in two passes. The first logs in to every account and applies
+pending moves. A move whose email is gone from its server folder is dropped
+with its local copy. The first pass then applies flag changes and removals,
+matching by `ServerFolder`, and counts the emails to download. Moving needs
+UIDPLUS so the new UID is known without downloading the email again. The second
+pass downloads the counted emails. `SyncProgress` returns the downloaded and
+total counts for the percentage beside the logo, and each folder writes its
+counts to the sync log. While downloading, the index is saved at most every 30
+seconds and once more when each account finishes.
 
 Next, in rough order:
 
-1. The offline action queue with its server-side check, including persisting
-   pending reads across restarts.
-2. SMTP sending, the Markdown subset to HTML, and HTML signatures.
-3. Email details and attachments in the viewer page.
-4. Release setup for the AUR and Nix, following battui.
+1. SMTP sending, the Markdown subset to HTML, and HTML signatures.
+2. Email details and attachments in the viewer page.
+3. Release setup for the AUR and Nix, following battui.
 
 ## Maintenance
 

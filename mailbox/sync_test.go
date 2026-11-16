@@ -9,12 +9,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -139,7 +141,7 @@ See you there.
 		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
 			return memory.NewSession(), nil, nil
 		},
-		Caps:      imap.CapSet{imap.CapIMAP4rev1: {}},
+		Caps:      imap.CapSet{imap.CapIMAP4rev1: {}, imap.CapUIDPlus: {}, imap.CapMove: {}},
 		TLSConfig: serverTLS,
 		Logger:    discardLogger{},
 	})
@@ -156,6 +158,13 @@ See you there.
 	account := Account{Name: "Personal", Email: "me@example.com", IMAP: listener.Addr().String(), PasswordCommand: "echo secret", Folders: []string{"Events"}}
 	mirrorDirectory := t.TempDir()
 	mail := New([]Account{account}, mirrorDirectory, 365)
+
+	var reports []string
+
+	report := func(format string, arguments ...any) {
+		reports = append(reports, fmt.Sprintf(format, arguments...))
+		t.Logf(format, arguments...)
+	}
 
 	subjects := func(box *Mailbox, folder string) string {
 		var found []string
@@ -279,6 +288,112 @@ See you there.
 			},
 		},
 		{
+			name: "read and archive survive a restart",
+			action: func() error {
+				received := now.AddDate(0, -2, 0)
+
+				appendMessage("INBOX", received, nil, `From: Pine Street Lettings <office@example.org>
+Subject: Quarterly report
+Date: `+received.Format(time.RFC1123Z)+`
+Content-Type: text/plain
+
+Rent statement attached.
+`)
+
+				mail.Sync(context.Background(), t.Logf)
+
+				quarterly := mail.Folder("Personal", Inbox)[1]
+
+				mail.MarkRead(quarterly.ID)
+
+				err := mail.Move(quarterly.ID, Archive)
+
+				if err != nil {
+					return err
+				}
+
+				err = mail.Save()
+
+				if err != nil {
+					return err
+				}
+
+				mail = New([]Account{account}, mirrorDirectory, 365)
+
+				got := subjects(mail, Archive)
+
+				if got != "" {
+					t.Errorf("restarted mailbox opened before sync: %q", got)
+				}
+
+				return mail.Sync(context.Background(), report)
+			},
+			wantErr: "the server has no Sent folder",
+			check: func(t *testing.T) {
+				fresh := New([]Account{account}, t.TempDir(), 365)
+				fresh.Sync(context.Background(), t.Logf)
+
+				for _, box := range []*Mailbox{mail, fresh} {
+					inbox := subjects(box, Inbox)
+					archive := subjects(box, Archive)
+
+					if inbox != "Saturday walk?" || archive != "Trip confirmed, Quarterly report" {
+						t.Errorf("got inbox %q and archive %q", inbox, archive)
+					}
+				}
+
+				loaded, err := mail.Load(mail.Folder("Personal", Archive)[1].ID)
+
+				if err != nil || !strings.Contains(loaded.Text, "Rent statement") {
+					t.Errorf("load: %v %q", err, loaded.Text)
+				}
+
+				if !slices.Contains(reports, "Personal Inbox: moved 1, dropped 0 already moved or deleted elsewhere") {
+					t.Errorf("reports: %q", reports)
+				}
+			},
+		},
+		{
+			name: "move dropped when deleted elsewhere",
+			action: func() error {
+				err := mail.Move(mail.Folder("Personal", Inbox)[0].ID, "Events")
+
+				if err != nil {
+					return err
+				}
+
+				client, err := imapclient.DialStartTLS(listener.Addr().String(), nil)
+
+				if err != nil {
+					return err
+				}
+
+				defer client.Close()
+
+				client.Login("me@example.com", "secret").Wait()
+				client.Select("INBOX", nil).Wait()
+				client.Store(imap.SeqSetNum(1), &imap.StoreFlags{Op: imap.StoreFlagsAdd, Flags: []imap.Flag{imap.FlagDeleted}}, nil).Close()
+				client.Expunge().Close()
+
+				reports = nil
+
+				return mail.Sync(context.Background(), report)
+			},
+			wantErr: "the server has no Sent folder",
+			check: func(t *testing.T) {
+				inbox := subjects(mail, Inbox)
+				events := subjects(mail, "Events")
+
+				if inbox != "" || events != "Winter social" {
+					t.Errorf("got inbox %q and events %q", inbox, events)
+				}
+
+				if !slices.Contains(reports, "Personal Inbox: moved 0, dropped 1 already moved or deleted elsewhere") {
+					t.Errorf("reports: %q", reports)
+				}
+			},
+		},
+		{
 			name: "restart offline reads the mirror",
 			action: func() error {
 				server.Close()
@@ -294,7 +409,7 @@ See you there.
 			check: func(t *testing.T) {
 				got := subjects(mail, Archive)
 
-				if got != "Trip confirmed" {
+				if got != "Trip confirmed, Quarterly report" {
 					t.Errorf("archive: got %q", got)
 				}
 

@@ -68,18 +68,19 @@ type Attachment struct {
 }
 
 type Message struct {
-	ID          string
-	Account     string
-	Folder      string
-	From        Address
-	To          []Address
-	Subject     string
-	Date        time.Time
-	Unread      bool
-	Text        string
-	HTML        string
-	Attachments []Attachment
-	UID         uint32
+	ID           string
+	Account      string
+	Folder       string
+	ServerFolder string
+	From         Address
+	To           []Address
+	Subject      string
+	Date         time.Time
+	Unread       bool
+	Text         string
+	HTML         string
+	Attachments  []Attachment
+	UID          uint32
 }
 
 type Account struct {
@@ -101,6 +102,7 @@ type Draft struct {
 
 type Mailbox struct {
 	mutex           sync.Mutex
+	saving          sync.Mutex
 	accounts        []Account
 	messages        []Message
 	mirrorDirectory string
@@ -115,6 +117,7 @@ type openedAccount struct {
 	password string
 	mirror   *mirror.Mirror
 	folders  map[string]folderIndex
+	changed  bool
 }
 
 type folderIndex struct {
@@ -123,8 +126,9 @@ type folderIndex struct {
 }
 
 type accountIndex struct {
-	Folders  map[string]folderIndex
-	Messages []Message
+	Folders      map[string]folderIndex
+	Messages     []Message
+	PendingReads []string
 }
 
 type storedBody struct {
@@ -278,7 +282,10 @@ func (b *Mailbox) Move(id, folder string) error {
 		return fmt.Errorf("%s has no %s folder", message.Account, folder)
 	}
 
-	return errors.New("moving isn't built yet")
+	message.Folder = folder
+	b.opened[message.Account].changed = true
+
+	return nil
 }
 
 func (b *Mailbox) MarkRead(id string) {
@@ -289,8 +296,35 @@ func (b *Mailbox) MarkRead(id string) {
 		if b.messages[i].ID == id {
 			b.messages[i].Unread = false
 			b.pendingSeen[id] = true
+			b.opened[b.messages[i].Account].changed = true
 		}
 	}
+}
+
+func (b *Mailbox) Save() error {
+	b.mutex.Lock()
+
+	changed := map[string]*openedAccount{}
+
+	for name, opened := range b.opened {
+		if opened.changed {
+			changed[name] = opened
+		}
+	}
+
+	b.mutex.Unlock()
+
+	var failures []error
+
+	for name, opened := range changed {
+		err := b.saveIndex(name, opened)
+
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", name, err))
+		}
+	}
+
+	return errors.Join(failures...)
 }
 
 func (b *Mailbox) SyncProgress() (done, total int) {
@@ -438,7 +472,16 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 
 				for _, message := range index.Messages {
 					message.Account = account.Name
+
+					if message.ServerFolder == "" {
+						message.ServerFolder = message.Folder
+					}
+
 					b.messages = append(b.messages, message)
+				}
+
+				for _, id := range index.PendingReads {
+					b.pendingSeen[id] = true
 				}
 
 				b.opened[account.Name] = opened
@@ -463,6 +506,8 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 			}
 
 			var folderFailures []error
+
+			servers := map[string]string{}
 
 			for _, folder := range account.Folders {
 				specialUse := map[string]string{Sent: `\Sent`, Spam: `\Junk`, Trash: `\Trash`, Archive: `\Archive`}[folder]
@@ -490,6 +535,124 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 					continue
 				}
 
+				servers[folder] = server
+			}
+
+			pendingMoves := map[string][]Message{}
+
+			b.mutex.Lock()
+
+			for _, message := range b.messages {
+				if message.Account == account.Name && message.Folder != message.ServerFolder {
+					pendingMoves[message.ServerFolder] = append(pendingMoves[message.ServerFolder], message)
+				}
+			}
+
+			b.mutex.Unlock()
+
+			for _, source := range account.Folders {
+				moves := pendingMoves[source]
+				sourceServer := servers[source]
+
+				if len(moves) == 0 || sourceServer == "" {
+					continue
+				}
+
+				uidValidity, err := session.Select(sourceServer)
+
+				if err != nil {
+					folderFailures = append(folderFailures, fmt.Errorf("opening %s: %w", source, err))
+					continue
+				}
+
+				var uids []uint32
+
+				for _, message := range moves {
+					uids = append(uids, message.UID)
+				}
+
+				present := map[uint32]bool{}
+				known := opened.folders[source]
+
+				if known.Server == sourceServer && known.UIDValidity == uidValidity {
+					present, err = session.Seen(uids)
+
+					if err != nil {
+						folderFailures = append(folderFailures, fmt.Errorf("checking emails to move from %s: %w", source, err))
+						continue
+					}
+				}
+
+				dropped := map[string]bool{}
+				byDestination := map[string][]uint32{}
+
+				for _, message := range moves {
+					_, onServer := present[message.UID]
+
+					if !onServer {
+						dropped[message.ID] = true
+						continue
+					}
+
+					byDestination[message.Folder] = append(byDestination[message.Folder], message.UID)
+				}
+
+				b.mutex.Lock()
+
+				b.messages = slices.DeleteFunc(b.messages, func(m Message) bool { return dropped[m.ID] })
+
+				for id := range dropped {
+					delete(b.pendingSeen, id)
+				}
+
+				b.mutex.Unlock()
+
+				for id := range dropped {
+					opened.mirror.Remove(bodyFile(id))
+				}
+
+				movedCount := 0
+
+				for _, destination := range account.Folders {
+					destinationUIDs := byDestination[destination]
+
+					if len(destinationUIDs) == 0 || servers[destination] == "" {
+						continue
+					}
+
+					moved, err := session.Move(destinationUIDs, servers[destination])
+
+					if err != nil {
+						folderFailures = append(folderFailures, fmt.Errorf("moving email from %s to %s: %w", source, destination, err))
+						continue
+					}
+
+					b.mutex.Lock()
+
+					for i, message := range b.messages {
+						newUID, ok := moved[message.UID]
+
+						if ok && message.Account == account.Name && message.ServerFolder == source {
+							b.messages[i].ServerFolder = destination
+							b.messages[i].UID = newUID
+						}
+					}
+
+					b.mutex.Unlock()
+
+					movedCount += len(moved)
+				}
+
+				report("%s %s: moved %d, dropped %d already moved or deleted elsewhere", account.Name, source, movedCount, len(dropped))
+			}
+
+			for _, folder := range account.Folders {
+				server, ok := servers[folder]
+
+				if !ok {
+					continue
+				}
+
 				uidValidity, err := session.Select(server)
 
 				if err != nil {
@@ -505,7 +668,7 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 					b.mutex.Lock()
 
 					b.messages = slices.DeleteFunc(b.messages, func(m Message) bool {
-						drop := m.Account == account.Name && m.Folder == folder
+						drop := m.Account == account.Name && m.ServerFolder == folder
 
 						if drop {
 							dropped = append(dropped, m.ID)
@@ -543,7 +706,7 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 				b.mutex.Lock()
 
 				for _, message := range b.messages {
-					if message.Account != account.Name || message.Folder != folder {
+					if message.Account != account.Name || message.ServerFolder != folder {
 						continue
 					}
 
@@ -589,7 +752,7 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 
 				b.messages = slices.DeleteFunc(b.messages, func(m Message) bool {
 					_, onServer := seen[m.UID]
-					remove := m.Account == account.Name && m.Folder == folder && !onServer
+					remove := m.Account == account.Name && m.ServerFolder == folder && !onServer
 
 					if remove {
 						removed = append(removed, m.ID)
@@ -599,7 +762,7 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 				})
 
 				for i, message := range b.messages {
-					if message.Account == account.Name && message.Folder == folder && !b.pendingSeen[message.ID] {
+					if message.Account == account.Name && message.ServerFolder == folder && !b.pendingSeen[message.ID] {
 						b.messages[i].Unread = !seen[message.UID]
 					}
 				}
@@ -769,15 +932,16 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 							id := fmt.Sprintf("%s:%s:%d:%d", account.Email, folder, uidValidity, fetched.UID)
 
 							message := Message{
-								ID:      id,
-								Account: account.Name,
-								Folder:  folder,
-								From:    Address{Name: fetched.From.Name, Email: fetched.From.Email},
-								Subject: fetched.Subject,
-								Date:    fetched.Date,
-								Unread:  !fetched.Seen,
-								Text:    fetched.Text,
-								UID:     fetched.UID,
+								ID:           id,
+								Account:      account.Name,
+								Folder:       folder,
+								ServerFolder: folder,
+								From:         Address{Name: fetched.From.Name, Email: fetched.From.Email},
+								Subject:      fetched.Subject,
+								Date:         fetched.Date,
+								Unread:       !fetched.Seen,
+								Text:         fetched.Text,
+								UID:          fetched.UID,
 							}
 
 							for _, recipient := range fetched.To {
@@ -858,6 +1022,9 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 }
 
 func (b *Mailbox) saveIndex(accountName string, opened *openedAccount) error {
+	b.saving.Lock()
+	defer b.saving.Unlock()
+
 	index := accountIndex{}
 
 	b.mutex.Lock()
@@ -865,10 +1032,18 @@ func (b *Mailbox) saveIndex(accountName string, opened *openedAccount) error {
 	index.Folders = maps.Clone(opened.folders)
 
 	for _, message := range b.messages {
-		if message.Account == accountName {
-			index.Messages = append(index.Messages, message)
+		if message.Account != accountName {
+			continue
+		}
+
+		index.Messages = append(index.Messages, message)
+
+		if b.pendingSeen[message.ID] {
+			index.PendingReads = append(index.PendingReads, message.ID)
 		}
 	}
+
+	opened.changed = false
 
 	b.mutex.Unlock()
 
@@ -876,13 +1051,15 @@ func (b *Mailbox) saveIndex(accountName string, opened *openedAccount) error {
 
 	err := gob.NewEncoder(&encoded).Encode(index)
 
-	if err != nil {
-		return fmt.Errorf("saving the mirror index: %w", err)
+	if err == nil {
+		err = opened.mirror.Write("index", encoded.Bytes())
 	}
 
-	err = opened.mirror.Write("index", encoded.Bytes())
-
 	if err != nil {
+		b.mutex.Lock()
+		opened.changed = true
+		b.mutex.Unlock()
+
 		return fmt.Errorf("saving the mirror index: %w", err)
 	}
 

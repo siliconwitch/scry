@@ -28,6 +28,9 @@ browser window beside it.
 ## Accounts and folders
 
 - scry works with any number of IMAP accounts, including Gmail.
+- Moving email needs a server with the UIDPLUS extension, which reports where
+  a moved email lands. Gmail, Fastmail and Dovecot have it. Without it, scry
+  would have to download the email again and fetch its images a second time.
 - The inbox shows mail from every account together. Each email shows which
   account it belongs to.
 - Each account has its own colour, set by its order in the config. The colour

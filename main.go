@@ -116,8 +116,10 @@ func main() {
 		}
 	}
 
+	mail := mailbox.New(accounts, filepath.Join(stateDirectory, "scry", "mirror"), settings.HistoryDays)
+
 	root := tui.New(tui.Options{
-		Mail:         mailbox.New(accounts, filepath.Join(stateDirectory, "scry", "mirror"), settings.HistoryDays),
+		Mail:         mail,
 		Viewer:       server,
 		Log:          log,
 		LogDirectory: logDirectory,
@@ -128,8 +130,15 @@ func main() {
 
 	_, err = program.Run()
 
+	saveErr := mail.Save()
+
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "scry:", err)
+		os.Exit(1)
+	}
+
+	if saveErr != nil {
+		fmt.Fprintln(os.Stderr, "scry: saving the mirror:", saveErr)
 		os.Exit(1)
 	}
 }

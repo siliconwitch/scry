@@ -171,6 +171,42 @@ func (s *Session) Seen(uids []uint32) (map[uint32]bool, error) {
 	return seen, nil
 }
 
+func (s *Session) Move(uids []uint32, destination string) (map[uint32]uint32, error) {
+	if !s.client.Caps().Has(imap.CapUIDPlus) {
+		return nil, errors.New("the server doesn't support UIDPLUS, which moving needs")
+	}
+
+	moved := map[uint32]uint32{}
+
+	for batch := range slices.Chunk(uids, 500) {
+		data, err := s.client.Move(uidSet(batch), destination).Wait()
+
+		if err != nil {
+			return nil, err
+		}
+
+		sourceSet, sourceOK := data.SourceUIDs.(imap.UIDSet)
+		destinationSet, destinationOK := data.DestUIDs.(imap.UIDSet)
+
+		if !sourceOK || !destinationOK {
+			continue
+		}
+
+		sources, _ := sourceSet.Nums()
+		destinations, _ := destinationSet.Nums()
+
+		if len(sources) != len(destinations) {
+			continue
+		}
+
+		for i, source := range sources {
+			moved[uint32(source)] = uint32(destinations[i])
+		}
+	}
+
+	return moved, nil
+}
+
 func (s *Session) Fetch(uids []uint32, deliver func([]Fetched) error) error {
 	sizes := map[uint32]int64{}
 
