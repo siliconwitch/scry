@@ -92,7 +92,7 @@ var (
 	boldStyle = lipgloss.NewStyle().Bold(true)
 )
 
-var clickableKeys = []string{"A", "M", "!", "D", "r", "n", "ctrl+r", "L", "q", "/", "e", "s", "h", "x", "u", "w", "y", "enter", "esc"}
+var clickableKeys = []string{"A", "M", "!", "D", "r", "R", "n", "ctrl+r", "L", "q", "/", "e", "s", "h", "x", "u", "w", "y", "enter", "esc"}
 
 type Model struct {
 	options Options
@@ -127,13 +127,14 @@ type Model struct {
 	sendRemaining int
 	sendGen       int
 
-	popup          popup
-	moveTargets    []string
-	moveIndex      int
-	logLines       []string
-	logOffset      int
-	pendingCompose bool
-	pendingReplyID string
+	popup           popup
+	moveTargets     []string
+	moveIndex       int
+	logLines        []string
+	logOffset       int
+	pendingCompose  bool
+	pendingReplyID  string
+	pendingReplyAll bool
 
 	notice           string
 	noticeGeneration int
@@ -399,7 +400,7 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 			m.draftError = ""
 
 			if m.pendingCompose {
-				return m, m.startCompose(m.pendingReplyID)
+				return m, m.startCompose(m.pendingReplyID, m.pendingReplyAll)
 			}
 
 			return m, m.setNotice("Draft discarded")
@@ -467,7 +468,7 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "n":
-		return m, m.requestCompose("")
+		return m, m.requestCompose("", false)
 
 	case "/":
 		m.draftVisible = false
@@ -577,9 +578,20 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 
 	case "r":
 		if hasSelection {
-			return m, m.requestCompose(selected.ID)
+			return m, m.requestCompose(selected.ID, true)
 		}
 
+	case "R":
+		if hasSelection {
+			return m, m.requestCompose(selected.ID, false)
+		}
+
+	case "y":
+		if !hasSelection {
+			return m, nil
+		}
+
+		return m, tea.Batch(tea.SetClipboard(selected.From.Email), m.setNotice("Copied "+selected.From.Email))
 	}
 
 	return m, nil
@@ -782,18 +794,19 @@ func (m *Model) moveSelected(folder string) tea.Cmd {
 	return m.setNotice("Moved to " + folder)
 }
 
-func (m *Model) requestCompose(replyID string) tea.Cmd {
+func (m *Model) requestCompose(replyID string, replyAll bool) tea.Cmd {
 	if m.draft != nil {
 		m.pendingCompose = true
 		m.pendingReplyID = replyID
+		m.pendingReplyAll = replyAll
 		m.popup = discardPopup
 		return nil
 	}
 
-	return m.startCompose(replyID)
+	return m.startCompose(replyID, replyAll)
 }
 
-func (m *Model) startCompose(replyID string) tea.Cmd {
+func (m *Model) startCompose(replyID string, replyAll bool) tea.Cmd {
 	draft := mailbox.Draft{Account: m.accounts[0].Name}
 
 	if row := m.folderRows[m.folderIndex]; row.account != "" {
@@ -811,9 +824,24 @@ func (m *Model) startCompose(replyID string) tea.Cmd {
 			quoted.WriteString("> " + line + "\n")
 		}
 
+		recipients := []string{original.From.Email}
+
+		if replyAll {
+			account, _ := m.options.Mail.Account(original.Account)
+
+			recipients = nil
+			for _, address := range append([]mailbox.Address{original.From}, original.To...) {
+				if strings.EqualFold(address.Email, account.Email) || slices.ContainsFunc(recipients, func(email string) bool { return strings.EqualFold(email, address.Email) }) {
+					continue
+				}
+
+				recipients = append(recipients, address.Email)
+			}
+		}
+
 		draft = mailbox.Draft{
 			Account: original.Account,
-			To:      original.From.Email,
+			To:      strings.Join(recipients, ", "),
 			Subject: subject,
 			Body:    "\n\nOn " + original.Date.Format("Mon 2 Jan 2006 at 15:04") + ", " + original.From.Short() + " wrote:\n" + quoted.String(),
 			ReplyTo: original.ID,
@@ -918,7 +946,7 @@ func (m *Model) setNotice(text string) tea.Cmd {
 }
 
 func (m *Model) panesHeight() int {
-	return max(3, m.height-2)
+	return max(3, m.height-3)
 }
 
 func (m *Model) listRows() int {
@@ -1314,66 +1342,87 @@ func (m *Model) draftView(innerWidth, innerHeight int) string {
 }
 
 func (m *Model) footer() string {
-	var buttons []string
+	var rows [][]string
 
 	switch {
 	case m.popup == movePopup:
-		buttons = []string{m.button("enter", "move"), m.button("esc", "cancel")}
+		rows = [][]string{{m.button("enter", "move"), m.button("esc", "cancel")}}
 
 	case m.popup == discardPopup:
-		buttons = []string{m.button("y", "discard"), m.button("n", "keep")}
+		rows = [][]string{{m.button("y", "discard"), m.button("n", "keep")}}
 
 	case m.popup == logPopup:
-		buttons = []string{m.button("esc", "close")}
+		rows = [][]string{{m.button("esc", "close")}}
 
 	case m.sending:
-		buttons = []string{m.button("u", "undo send")}
+		rows = [][]string{{m.button("u", "undo send")}}
 
 	case m.delivering:
-		return ""
 
 	case m.draftVisible:
-		buttons = []string{m.button("e", "edit"), m.button("s", "send"), m.button("h", "hide"), m.button("x", "discard")}
+		rows = [][]string{{m.button("e", "edit"), m.button("s", "send"), m.button("h", "hide"), m.button("x", "discard")}}
 
 	case m.searchFocused:
-		buttons = []string{m.button("enter", "browse results"), m.button("esc", "clear search")}
+		rows = [][]string{{m.button("enter", "browse results"), m.button("esc", "clear search")}}
 
 	default:
-		buttons = []string{
-			m.button("A", "archive"), m.button("M", "move"), m.button("!", "spam"), m.button("D", "delete"),
-			m.button("r", "reply"), m.button("n", "new"), m.button("/", "search"), m.button("ctrl+r", "refresh"),
-			m.button("L", "log"), m.button("q", "quit"),
+		rows = [][]string{
+			{
+				m.button("A", "archive"), m.button("M", "move"), m.button("!", "spam"), m.button("D", "delete"),
+				m.button("r", "reply all"), m.button("R", "reply"),
+			},
+			{
+				m.button("ctrl+r", "sync"), m.button("n", "new"), m.button("L", "log"), m.button("/", "search"),
+				m.button("y", "yank sender"), m.button("q", "quit"),
+			},
+		}
+	}
+
+	var columnWidths []int
+	for _, buttons := range rows {
+		for column, button := range buttons {
+			if column == len(columnWidths) {
+				columnWidths = append(columnWidths, 0)
+			}
+
+			columnWidths[column] = max(columnWidths[column], lipgloss.Width(button))
 		}
 	}
 
 	textWidth := 0
-	for _, button := range buttons {
-		textWidth += lipgloss.Width(button)
+	for _, columnWidth := range columnWidths {
+		textWidth += columnWidth
 	}
 
-	gaps := max(1, len(buttons)-1)
+	gaps := max(1, len(columnWidths)-1)
 	base, extra := 1, 0
 
 	if spacing := m.width - 2 - textWidth; spacing > gaps {
 		base, extra = spacing/gaps, spacing%gaps
 	}
 
-	var bar strings.Builder
+	lines := []string{"", ""}
 
-	for i, button := range buttons {
-		bar.WriteString(button)
+	for row, buttons := range rows {
+		var bar strings.Builder
 
-		if i < len(buttons)-1 {
-			width := base
-			if i < extra {
-				width++
+		for column, button := range buttons {
+			bar.WriteString(button)
+
+			if column < len(buttons)-1 {
+				gap := base
+				if column < extra {
+					gap++
+				}
+
+				bar.WriteString(strings.Repeat(" ", columnWidths[column]-lipgloss.Width(button)+gap))
 			}
-
-			bar.WriteString(strings.Repeat(" ", width))
 		}
+
+		lines[row] = " " + ansi.Truncate(bar.String(), m.width-2, "")
 	}
 
-	return " " + ansi.Truncate(bar.String(), m.width-2, "")
+	return strings.Join(lines, "\n")
 }
 
 func (m *Model) accountColor(name string) adaptiveColor {
