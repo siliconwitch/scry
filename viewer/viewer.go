@@ -23,12 +23,16 @@ type Attachment struct {
 	Data []byte
 }
 
+type Address struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
+}
+
 type Page struct {
 	ID           string
-	Account      string
 	Subject      string
-	From         string
-	To           string
+	From         Address
+	To           []Address
 	Date         string
 	HTML         string
 	Text         string
@@ -150,7 +154,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"empty":        page.ID == "",
-			"account":      page.Account,
 			"accountLight": page.AccountLight,
 			"accountDark":  page.AccountDark,
 			"subject":      page.Subject,

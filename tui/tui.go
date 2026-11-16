@@ -738,9 +738,9 @@ func (m *Model) showSelected() {
 		return
 	}
 
-	var recipients []string
+	recipients := []viewer.Address{}
 	for _, recipient := range message.To {
-		recipients = append(recipients, recipient.String())
+		recipients = append(recipients, viewer.Address{Name: recipient.Name, Email: recipient.Email})
 	}
 
 	var attachments []viewer.Attachment
@@ -750,10 +750,9 @@ func (m *Model) showSelected() {
 
 	m.options.Viewer.Show(viewer.Page{
 		ID:           message.ID,
-		Account:      message.Account,
 		Subject:      message.Subject,
-		From:         message.From.String(),
-		To:           strings.Join(recipients, ", "),
+		From:         viewer.Address{Name: message.From.Name, Email: message.From.Email},
+		To:           recipients,
 		Date:         message.Date.Format("Mon 2 Jan 2006, 15:04"),
 		HTML:         message.HTML,
 		Text:         message.Text,

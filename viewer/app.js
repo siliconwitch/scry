@@ -6,6 +6,42 @@ const formatSize = (bytes) => {
   return (bytes / 1024 / 1024).toFixed(1) + " MB";
 };
 
+let toastTimer;
+
+const copyable = (text) => {
+  const span = document.createElement("span");
+  span.className = "copy";
+  span.textContent = text;
+
+  span.onclick = async () => {
+    await navigator.clipboard.writeText(text);
+
+    const toast = element("toast");
+    toast.textContent = "Copied " + text;
+    toast.hidden = false;
+
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => (toast.hidden = true), 1500);
+  };
+
+  return span;
+};
+
+const showAddresses = (target, addresses) => {
+  target.replaceChildren();
+
+  addresses.forEach((address, index) => {
+    if (index > 0) target.append(", ");
+
+    if (!address.name) {
+      target.append(copyable(address.email));
+      return;
+    }
+
+    target.append(copyable(address.name), " <", copyable(address.email), ">");
+  });
+};
+
 const showState = (text) => {
   element("state-text").textContent = text;
   element("state").hidden = false;
@@ -23,11 +59,10 @@ const refresh = async () => {
   }
 
   element("subject").textContent = page.subject || "(no subject)";
-  element("account").textContent = page.account;
   document.body.style.setProperty("--account-light", page.accountLight);
   document.body.style.setProperty("--account-dark", page.accountDark);
-  element("from").textContent = page.from;
-  element("to").textContent = page.to;
+  showAddresses(element("from"), [page.from]);
+  showAddresses(element("to"), page.to);
   element("date").textContent = page.date;
 
   const attachments = element("attachments");
