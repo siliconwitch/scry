@@ -261,6 +261,7 @@ func (b *Mailbox) Move(id, folder string) error {
 	defer b.mutex.Unlock()
 
 	index := slices.IndexFunc(b.messages, func(m Message) bool { return m.ID == id })
+
 	if index < 0 {
 		return fmt.Errorf("message %s not found", id)
 	}
@@ -272,6 +273,7 @@ func (b *Mailbox) Move(id, folder string) error {
 	}
 
 	accountIndex := slices.IndexFunc(b.accounts, func(a Account) bool { return a.Name == message.Account })
+
 	if accountIndex < 0 || !slices.Contains(b.accounts[accountIndex].Folders, folder) {
 		return fmt.Errorf("%s has no %s folder", message.Account, folder)
 	}
@@ -495,7 +497,9 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 					continue
 				}
 
-				if known := opened.folders[folder]; known.Server != server || known.UIDValidity != uidValidity {
+				known := opened.folders[folder]
+
+				if known.Server != server || known.UIDValidity != uidValidity {
 					var dropped []string
 
 					b.mutex.Lock()
@@ -532,7 +536,7 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 					continue
 				}
 
-				known := map[uint32]bool{}
+				knownUIDs := map[uint32]bool{}
 				var pendingIDs []string
 				var pendingUIDs []uint32
 
@@ -543,7 +547,7 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 						continue
 					}
 
-					known[message.UID] = true
+					knownUIDs[message.UID] = true
 
 					if b.pendingSeen[message.ID] {
 						pendingIDs = append(pendingIDs, message.ID)
@@ -570,7 +574,7 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 				var fresh []uint32
 
 				for _, uid := range uids {
-					if !known[uid] {
+					if !knownUIDs[uid] {
 						fresh = append(fresh, uid)
 					}
 				}
@@ -654,6 +658,8 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 
 			var folderFailures []error
 
+			lastSaved := time.Now()
+
 			for _, planned := range plan.folders {
 				folder := planned.folder
 				uidValidity := planned.uidValidity
@@ -707,35 +713,45 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 												continue
 											}
 
-											dataURI, done := downloaded[attribute.Val]
+											_, done := downloaded[attribute.Val]
 
 											if !done {
+												downloaded[attribute.Val] = ""
+
 												request, err := http.NewRequestWithContext(groupCtx, http.MethodGet, attribute.Val, nil)
 
-												if err == nil {
-													response, err := imageClient.Do(request)
-
-													if err == nil {
-														image, err := io.ReadAll(io.LimitReader(response.Body, 5<<20+1))
-														response.Body.Close()
-
-														contentType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
-
-														if !strings.HasPrefix(contentType, "image/") {
-															contentType = http.DetectContentType(image)
-														}
-
-														if err == nil && response.StatusCode == http.StatusOK && len(image) <= 5<<20 && strings.HasPrefix(contentType, "image/") {
-															dataURI = "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(image)
-														}
-													}
+												if err != nil {
+													continue
 												}
 
-												downloaded[attribute.Val] = dataURI
+												response, err := imageClient.Do(request)
+
+												if err != nil {
+													continue
+												}
+
+												image, err := io.ReadAll(io.LimitReader(response.Body, 5<<20+1))
+												response.Body.Close()
+
+												if err != nil || response.StatusCode != http.StatusOK || len(image) > 5<<20 {
+													continue
+												}
+
+												contentType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
+
+												if !strings.HasPrefix(contentType, "image/") {
+													contentType = http.DetectContentType(image)
+												}
+
+												if !strings.HasPrefix(contentType, "image/") {
+													continue
+												}
+
+												downloaded[attribute.Val] = "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(image)
 											}
 
-											if dataURI != "" {
-												node.Attr[a].Val = dataURI
+											if downloaded[attribute.Val] != "" {
+												node.Attr[a].Val = downloaded[attribute.Val]
 											}
 										}
 									}
@@ -806,6 +822,12 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 					b.syncDone += len(messages)
 					b.mutex.Unlock()
 
+					if time.Since(lastSaved) < 30*time.Second {
+						return nil
+					}
+
+					lastSaved = time.Now()
+
 					return b.saveIndex(account.Name, opened)
 				})
 
@@ -816,6 +838,12 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 				if err != nil {
 					folderFailures = append(folderFailures, fmt.Errorf("downloading %s: %w", folder, err))
 				}
+			}
+
+			err = b.saveIndex(account.Name, opened)
+
+			if err != nil {
+				folderFailures = append(folderFailures, err)
 			}
 
 			return errors.Join(folderFailures...)

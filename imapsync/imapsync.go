@@ -231,11 +231,13 @@ func (s *Session) Fetch(uids []uint32, deliver func([]Fetched) error) error {
 			fetched.Date, _ = reader.Header.Date()
 
 			from, _ := reader.Header.AddressList("From")
+
 			if len(from) > 0 {
 				fetched.From = Address{Name: from[0].Name, Email: from[0].Address}
 			}
 
 			to, _ := reader.Header.AddressList("To")
+
 			for _, address := range to {
 				fetched.To = append(fetched.To, Address{Name: address.Name, Email: address.Address})
 			}
@@ -276,8 +278,12 @@ func (s *Session) Fetch(uids []uint32, deliver func([]Fetched) error) error {
 				case isAttachment || parameters["name"] != "" || strings.HasPrefix(contentType, "image/"):
 					name := parameters["name"]
 
-					if attachmentHeader, ok := part.Header.(*mail.AttachmentHeader); ok {
-						if filename, err := attachmentHeader.Filename(); err == nil && filename != "" {
+					attachmentHeader, ok := part.Header.(*mail.AttachmentHeader)
+
+					if ok {
+						filename, err := attachmentHeader.Filename()
+
+						if err == nil && filename != "" {
 							name = filename
 						}
 					}

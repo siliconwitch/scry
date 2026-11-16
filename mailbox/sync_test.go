@@ -190,12 +190,16 @@ See you there.
 				}
 
 				for folder, want := range expected {
-					if got := subjects(mail, folder); got != want {
+					got := subjects(mail, folder)
+
+					if got != want {
 						t.Errorf("%s: got %q, want %q", folder, got, want)
 					}
 				}
 
-				if done, total := mail.SyncProgress(); done != 4 || total != 4 {
+				done, total := mail.SyncProgress()
+
+				if done != 4 || total != 4 {
 					t.Errorf("progress: got %d of %d, want 4 of 4", done, total)
 				}
 			},
@@ -232,7 +236,9 @@ See you there.
 				fresh := New([]Account{account}, t.TempDir(), 365)
 				fresh.Sync(context.Background(), t.Logf)
 
-				if got := subjects(fresh, Inbox); got != "Saturday walk?, Your tickets" {
+				got := subjects(fresh, Inbox)
+
+				if got != "Saturday walk?, Your tickets" {
 					t.Errorf("server state: got %q", got)
 				}
 			},
@@ -259,11 +265,15 @@ See you there.
 			},
 			wantErr: "the server has no Sent folder",
 			check: func(t *testing.T) {
-				if got := subjects(mail, Inbox); got != "Saturday walk?" {
+				got := subjects(mail, Inbox)
+
+				if got != "Saturday walk?" {
 					t.Errorf("inbox: got %q", got)
 				}
 
-				if got := subjects(mail, "Events"); got != "Winter social" {
+				got = subjects(mail, "Events")
+
+				if got != "Winter social" {
 					t.Errorf("events: got %q", got)
 				}
 			},
@@ -282,7 +292,9 @@ See you there.
 			},
 			wantErr: "logging in",
 			check: func(t *testing.T) {
-				if got := subjects(mail, Archive); got != "Trip confirmed" {
+				got := subjects(mail, Archive)
+
+				if got != "Trip confirmed" {
 					t.Errorf("archive: got %q", got)
 				}
 

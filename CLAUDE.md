@@ -127,7 +127,8 @@ Sync runs in two passes. The first logs in to every account, applies flag
 changes and removals, and counts the emails to download. The second downloads
 them. `SyncProgress` returns the downloaded and total counts for the
 percentage beside the logo, and each folder writes its counts to the sync log.
-The index is saved after every batch of downloads.
+While downloading, the index is saved at most every 30 seconds and once
+more when each account finishes.
 
 Next, in rough order:
 

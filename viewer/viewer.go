@@ -6,13 +6,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"html"
 	"mime"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+
+	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
 )
 
 //go:embed page.html app.js
@@ -104,6 +106,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	path, ok := strings.CutPrefix(r.URL.Path, "/"+s.token+"/")
+
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -120,15 +123,51 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; frame-src 'self'; connect-src 'self'; img-src data:")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		content, _ := assets.ReadFile("page.html")
+
 		w.Write(content)
 
 	case path == "app.js":
 		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 		content, _ := assets.ReadFile("app.js")
+
 		w.Write(content)
 
 	case path == "events":
-		s.serveEvents(w, r)
+		flusher, ok := w.(http.Flusher)
+
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+
+		changed := make(chan struct{}, 1)
+		changed <- struct{}{}
+
+		s.mutex.Lock()
+		s.listeners[changed] = true
+		s.mutex.Unlock()
+
+		defer func() {
+			s.mutex.Lock()
+			delete(s.listeners, changed)
+			s.mutex.Unlock()
+		}()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+
+		for {
+			select {
+			case <-changed:
+				fmt.Fprint(w, "data: changed\n\n")
+				flusher.Flush()
+
+			case <-r.Context().Done():
+				return
+
+			case <-s.done:
+				return
+			}
+		}
 
 	case path == "current":
 		s.mutex.Lock()
@@ -179,7 +218,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
 		if page.HTML != "" {
-			fmt.Fprint(w, `<base target="_blank">`, page.HTML)
+			document, err := html.Parse(strings.NewReader(page.HTML))
+
+			if err != nil {
+				http.Error(w, "This email can't be shown.", http.StatusInternalServerError)
+				return
+			}
+
+			for node := range document.Descendants() {
+				if node.DataAtom == atom.Head {
+					node.InsertBefore(&html.Node{Type: html.ElementNode, Data: "base", DataAtom: atom.Base, Attr: []html.Attribute{{Key: "target", Val: "_blank"}}}, node.FirstChild)
+					break
+				}
+			}
+
+			html.Render(w, document)
 			return
 		}
 
@@ -207,42 +260,5 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		http.NotFound(w, r)
-	}
-}
-
-func (s *Server) serveEvents(w http.ResponseWriter, r *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-		return
-	}
-
-	changed := make(chan struct{}, 1)
-	changed <- struct{}{}
-
-	s.mutex.Lock()
-	s.listeners[changed] = true
-	s.mutex.Unlock()
-
-	defer func() {
-		s.mutex.Lock()
-		delete(s.listeners, changed)
-		s.mutex.Unlock()
-	}()
-
-	w.Header().Set("Content-Type", "text/event-stream")
-
-	for {
-		select {
-		case <-changed:
-			fmt.Fprint(w, "data: changed\n\n")
-			flusher.Flush()
-
-		case <-r.Context().Done():
-			return
-
-		case <-s.done:
-			return
-		}
 	}
 }

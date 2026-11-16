@@ -42,6 +42,7 @@ func main() {
 	}
 
 	configPath := os.Getenv("SCRY_CONFIG")
+
 	if configPath == "" {
 		configDirectory, err := os.UserConfigDir()
 
@@ -74,6 +75,7 @@ func main() {
 	}
 
 	stateDirectory := os.Getenv("XDG_STATE_HOME")
+
 	if stateDirectory == "" {
 		stateDirectory = filepath.Join(home, ".local", "state")
 	}
@@ -98,13 +100,16 @@ func main() {
 
 	startNotice := ""
 
-	if settings.Viewer == "" {
+	words := strings.Fields(strings.ReplaceAll(settings.Viewer, "%s", server.URL()))
+
+	if len(words) == 0 {
 		startNotice = "No viewer command set. Press L for the viewer's address."
 	} else {
-		words := strings.Fields(strings.ReplaceAll(settings.Viewer, "%s", server.URL()))
 		browser := exec.Command(words[0], words[1:]...)
 
-		if err := browser.Start(); err != nil {
+		err := browser.Start()
+
+		if err != nil {
 			startNotice = "Can't start the viewer: " + err.Error()
 		} else {
 			go browser.Wait()

@@ -11,9 +11,34 @@ type searchTerm struct {
 }
 
 func Search(messages []Message, query string) []Message {
+	var words []string
+	var current strings.Builder
+
+	quoted := false
+
+	for _, character := range query {
+		switch {
+		case character == '"':
+			quoted = !quoted
+
+		case character == ' ' && !quoted:
+			if current.Len() > 0 {
+				words = append(words, current.String())
+				current.Reset()
+			}
+
+		default:
+			current.WriteRune(character)
+		}
+	}
+
+	if current.Len() > 0 {
+		words = append(words, current.String())
+	}
+
 	var terms []searchTerm
 
-	for _, word := range splitQuery(query) {
+	for _, word := range words {
 		field, value, found := strings.Cut(word, ":")
 
 		switch {
@@ -98,35 +123,6 @@ func Search(messages []Message, query string) []Message {
 	}
 
 	return found
-}
-
-func splitQuery(query string) []string {
-	var words []string
-	var current strings.Builder
-
-	quoted := false
-
-	for _, character := range query {
-		switch {
-		case character == '"':
-			quoted = !quoted
-
-		case character == ' ' && !quoted:
-			if current.Len() > 0 {
-				words = append(words, current.String())
-				current.Reset()
-			}
-
-		default:
-			current.WriteRune(character)
-		}
-	}
-
-	if current.Len() > 0 {
-		words = append(words, current.String())
-	}
-
-	return words
 }
 
 func matchScore(text, value string) int {

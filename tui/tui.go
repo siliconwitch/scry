@@ -112,6 +112,7 @@ type Model struct {
 
 	accounts     []mailbox.Account
 	folderRows   []folderRow
+	unreadCounts []int
 	folderIndex  int
 	messages     []mailbox.Message
 	messageIndex int
@@ -121,19 +122,20 @@ type Model struct {
 	search        textinput.Model
 	searchFocused bool
 
-	shownID     string
-	shownImages bool
+	shownID string
 
 	networkActive int
-	networkError  string
+	syncFailed    bool
+	sendFailed    bool
 
-	draft         *mailbox.Draft
-	draftVisible  bool
-	draftError    string
-	sending       bool
-	delivering    bool
-	sendRemaining int
-	sendGen       int
+	draft              *mailbox.Draft
+	draftVisible       bool
+	draftError         string
+	missingAttachments []string
+	sending            bool
+	delivering         bool
+	sendRemaining      int
+	sendGen            int
 
 	popup           popup
 	moveTargets     []string
@@ -194,14 +196,126 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyPressMsg:
-		if m.searchFocused && m.popup == noPopup {
-			return m.handleSearchKey(msg)
+		if !m.searchFocused || m.popup != noPopup {
+			return m.handleKey(msg.String())
 		}
 
-		return m.handleKey(msg.String())
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
 
-	case tea.MouseMsg:
-		return m.handleMouse(msg)
+		case "esc":
+			m.search.SetValue("")
+			m.search.Blur()
+			m.searchFocused = false
+			m.messageIndex = 0
+			m.listOffset = 0
+			m.reload()
+			return m, m.showSelected()
+
+		case "enter", "tab":
+			m.search.Blur()
+			m.searchFocused = false
+			m.focus = listPane
+			return m, nil
+
+		case "up", "ctrl+p":
+			m.focus = listPane
+			return m.handleKey("k")
+
+		case "down", "ctrl+n":
+			m.focus = listPane
+			return m.handleKey("j")
+		}
+
+		previous := m.search.Value()
+
+		var cmd tea.Cmd
+		m.search, cmd = m.search.Update(msg)
+
+		if m.search.Value() != previous {
+			m.messageIndex = 0
+			m.listOffset = 0
+			m.reload()
+			cmd = tea.Batch(cmd, m.showSelected())
+		}
+
+		return m, cmd
+
+	case tea.MouseWheelMsg:
+		key := "j"
+		if msg.Mouse().Button == tea.MouseWheelUp {
+			key = "k"
+		}
+
+		switch {
+		case m.popup != noPopup:
+			return m.handleKey(key)
+
+		case m.zones.Get("pane:folders").InBounds(msg):
+			m.focus = folderPane
+
+		case m.zones.Get("pane:list").InBounds(msg):
+			m.focus = listPane
+
+		default:
+			return m, nil
+		}
+
+		return m.handleKey(key)
+
+	case tea.MouseClickMsg:
+		if msg.Mouse().Button != tea.MouseLeft {
+			return m, nil
+		}
+
+		if m.zones.Get("search").InBounds(msg) {
+			return m.handleKey("/")
+		}
+
+		if m.searchFocused {
+			m.search.Blur()
+			m.searchFocused = false
+		}
+
+		for _, key := range clickableKeys {
+			if m.zones.Get("key:" + key).InBounds(msg) {
+				return m.handleKey(key)
+			}
+		}
+
+		if m.popup == movePopup {
+			for i := range m.moveTargets {
+				if m.zones.Get(fmt.Sprintf("move:%d", i)).InBounds(msg) {
+					m.moveIndex = i
+					return m.handleKey("enter")
+				}
+			}
+
+			return m, nil
+		}
+
+		if m.popup != noPopup {
+			return m, nil
+		}
+
+		for i := range m.folderRows {
+			if m.zones.Get(fmt.Sprintf("folder:%d", i)).InBounds(msg) {
+				m.focus = folderPane
+				m.draftVisible = false
+				return m, m.selectFolder(i)
+			}
+		}
+
+		for i := m.listOffset; i < min(len(m.messages), m.listOffset+m.listRows()); i++ {
+			if m.zones.Get(fmt.Sprintf("message:%d", i)).InBounds(msg) {
+				m.focus = listPane
+				m.messageIndex = i
+				return m, m.showSelected()
+			}
+		}
+
+		return m, nil
 
 	case syncProgressMsg:
 		if m.networkActive == 0 {
@@ -213,6 +327,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.showSelected(), tea.Tick(2*time.Second, func(time.Time) tea.Msg { return syncProgressMsg{} }))
 
 	case syncDoneMsg:
+		m.networkActive--
+		m.syncFailed = msg.err != nil
+
 		if msg.err != nil {
 			for _, line := range strings.Split(msg.err.Error(), "\n") {
 				m.options.Log.Write("Sync failed: %s", line)
@@ -222,7 +339,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.reload()
-		m.finishNetwork(msg.err)
 
 		return m, m.showSelected()
 
@@ -282,12 +398,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case sendDoneMsg:
 		m.delivering = false
+		m.networkActive--
+		m.sendFailed = msg.err != nil
 
 		if msg.err != nil {
 			m.options.Log.Write("Sending from %s failed: %v", m.draft.Account, msg.err)
 			m.draftError = "Couldn't send: " + msg.err.Error()
 			m.draftVisible = true
-			m.finishNetwork(msg.err)
 			return m, nil
 		}
 
@@ -296,8 +413,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.draft = nil
 		m.draftVisible = false
 		m.reload()
-
-		m.finishNetwork(nil)
 
 		return m, m.setNotice("Sent from " + account)
 
@@ -355,13 +470,25 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			edited.Account = m.draft.Account
 		}
 
-		if _, ok := m.options.Mail.Account(edited.Account); !ok && m.draftError == "" {
+		_, ok := m.options.Mail.Account(edited.Account)
+
+		if !ok && m.draftError == "" {
 			var names []string
 			for _, account := range m.accounts {
 				names = append(names, account.Name)
 			}
 
 			m.draftError = fmt.Sprintf("No account called %q. Use one of: %s.", edited.Account, strings.Join(names, ", "))
+		}
+
+		m.missingAttachments = nil
+
+		for _, path := range edited.Attach {
+			_, err := os.Stat(expandHome(path))
+
+			if err != nil {
+				m.missingAttachments = append(m.missingAttachments, path)
+			}
 		}
 
 		m.draft = &edited
@@ -371,50 +498,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
-}
-
-func (m *Model) handleSearchKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "ctrl+c":
-		return m, tea.Quit
-
-	case "esc":
-		m.search.SetValue("")
-		m.search.Blur()
-		m.searchFocused = false
-		m.messageIndex = 0
-		m.listOffset = 0
-		m.reload()
-		return m, m.showSelected()
-
-	case "enter", "tab":
-		m.search.Blur()
-		m.searchFocused = false
-		m.focus = listPane
-		return m, nil
-
-	case "up", "ctrl+p":
-		m.focus = listPane
-		return m.handleKey("k")
-
-	case "down", "ctrl+n":
-		m.focus = listPane
-		return m.handleKey("j")
-	}
-
-	previous := m.search.Value()
-
-	var cmd tea.Cmd
-	m.search, cmd = m.search.Update(msg)
-
-	if m.search.Value() != previous {
-		m.messageIndex = 0
-		m.listOffset = 0
-		m.reload()
-		cmd = tea.Batch(cmd, m.showSelected())
-	}
-
-	return m, cmd
 }
 
 func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
@@ -542,7 +625,9 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 			}
 
 			for _, path := range m.draft.Attach {
-				if _, err := os.Stat(expandHome(path)); err != nil {
+				_, err := os.Stat(expandHome(path))
+
+				if err != nil {
 					m.draftError = "Can't find the attachment " + path + "."
 					return m, nil
 				}
@@ -646,85 +731,6 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	mouse := msg.Mouse()
-
-	if _, wheel := msg.(tea.MouseWheelMsg); wheel {
-		key := "j"
-		if mouse.Button == tea.MouseWheelUp {
-			key = "k"
-		}
-
-		switch {
-		case m.popup != noPopup:
-			return m.handleKey(key)
-
-		case m.zones.Get("pane:folders").InBounds(msg):
-			m.focus = folderPane
-
-		case m.zones.Get("pane:list").InBounds(msg):
-			m.focus = listPane
-
-		default:
-			return m, nil
-		}
-
-		return m.handleKey(key)
-	}
-
-	if _, click := msg.(tea.MouseClickMsg); !click || mouse.Button != tea.MouseLeft {
-		return m, nil
-	}
-
-	if m.zones.Get("search").InBounds(msg) {
-		return m.handleKey("/")
-	}
-
-	if m.searchFocused {
-		m.search.Blur()
-		m.searchFocused = false
-	}
-
-	for _, key := range clickableKeys {
-		if m.zones.Get("key:" + key).InBounds(msg) {
-			return m.handleKey(key)
-		}
-	}
-
-	if m.popup == movePopup {
-		for i := range m.moveTargets {
-			if m.zones.Get(fmt.Sprintf("move:%d", i)).InBounds(msg) {
-				m.moveIndex = i
-				return m.handleKey("enter")
-			}
-		}
-
-		return m, nil
-	}
-
-	if m.popup != noPopup {
-		return m, nil
-	}
-
-	for i := range m.folderRows {
-		if m.zones.Get(fmt.Sprintf("folder:%d", i)).InBounds(msg) {
-			m.focus = folderPane
-			m.draftVisible = false
-			return m, m.selectFolder(i)
-		}
-	}
-
-	for i := m.listOffset; i < min(len(m.messages), m.listOffset+m.listRows()); i++ {
-		if m.zones.Get(fmt.Sprintf("message:%d", i)).InBounds(msg) {
-			m.focus = listPane
-			m.messageIndex = i
-			return m, m.showSelected()
-		}
-	}
-
-	return m, nil
-}
-
 func (m *Model) selectFolder(index int) tea.Cmd {
 	m.folderIndex = max(0, min(index, len(m.folderRows)-1))
 
@@ -740,10 +746,7 @@ func (m *Model) selectFolder(index int) tea.Cmd {
 }
 
 func (m *Model) reload() {
-	selectedID := ""
-	if message, ok := m.selected(); ok {
-		selectedID = message.ID
-	}
+	previous, _ := m.selected()
 
 	query := strings.TrimSpace(m.search.Value())
 
@@ -754,12 +757,20 @@ func (m *Model) reload() {
 		m.messages = m.options.Mail.Folder(row.account, row.folder)
 	}
 
-	if index := slices.IndexFunc(m.messages, func(message mailbox.Message) bool { return message.ID == selectedID }); index >= 0 {
+	index := slices.IndexFunc(m.messages, func(message mailbox.Message) bool { return message.ID == previous.ID })
+
+	if index >= 0 {
 		m.messageIndex = index
 	}
 
 	m.messageIndex = max(0, min(m.messageIndex, len(m.messages)-1))
 	m.clampList()
+
+	m.unreadCounts = make([]int, len(m.folderRows))
+
+	for i, row := range m.folderRows {
+		m.unreadCounts[i] = m.options.Mail.Unread(row.account, row.folder)
+	}
 }
 
 func (m *Model) selected() (mailbox.Message, bool) {
@@ -803,6 +814,7 @@ func (m *Model) showSelected() tea.Cmd {
 
 func (m *Model) moveSelected(folder string) tea.Cmd {
 	message, ok := m.selected()
+
 	if !ok {
 		return nil
 	}
@@ -839,12 +851,17 @@ func (m *Model) requestCompose(replyID string, replyAll bool) tea.Cmd {
 func (m *Model) startCompose(replyID string, replyAll bool) tea.Cmd {
 	draft := mailbox.Draft{Account: m.accounts[0].Name}
 
-	if row := m.folderRows[m.folderIndex]; row.account != "" {
+	row := m.folderRows[m.folderIndex]
+
+	if row.account != "" {
 		draft.Account = row.account
 	}
 
-	if original, ok := m.options.Mail.Get(replyID); ok {
+	original, ok := m.options.Mail.Get(replyID)
+
+	if ok {
 		subject := original.Subject
+
 		if !strings.HasPrefix(strings.ToLower(subject), "re:") {
 			subject = "Re: " + subject
 		}
@@ -886,6 +903,7 @@ func (m *Model) startCompose(replyID string, replyAll bool) tea.Cmd {
 
 func (m *Model) openEditor() tea.Cmd {
 	directory := os.Getenv("XDG_RUNTIME_DIR")
+
 	if directory == "" {
 		directory = os.TempDir()
 	}
@@ -922,15 +940,17 @@ func (m *Model) openEditor() tea.Cmd {
 	}
 
 	editor := os.Getenv("VISUAL")
+
 	if editor == "" {
 		editor = os.Getenv("EDITOR")
 	}
 
-	if editor == "" {
-		editor = "vi"
+	words := strings.Fields(editor)
+
+	if len(words) == 0 {
+		words = []string{"vi"}
 	}
 
-	words := strings.Fields(editor)
 	path := file.Name()
 
 	command := exec.Command(words[0], append(words[1:], path)...)
@@ -953,15 +973,6 @@ func (m *Model) startSync() tea.Cmd {
 	}
 
 	return tea.Batch(sync, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return syncProgressMsg{} }))
-}
-
-func (m *Model) finishNetwork(err error) {
-	m.networkActive--
-	m.networkError = ""
-
-	if err != nil {
-		m.networkError = err.Error()
-	}
 }
 
 func (m *Model) sendTick() tea.Cmd {
@@ -1013,10 +1024,312 @@ func (m *Model) View() tea.View {
 		return view
 	}
 
-	panesHeight := m.panesHeight()
-	listWidth := m.width - folderPaneWidth
+	statusColor := accentColor
+	switch {
+	case m.networkActive > 0:
+		statusColor = yellowColor
 
-	middle := lipgloss.JoinHorizontal(lipgloss.Top, m.folderView(panesHeight), m.rightView(listWidth, panesHeight))
+	case m.syncFailed || m.sendFailed:
+		statusColor = redColor
+	}
+
+	logo := " " + m.zones.Mark("key:L", m.style(statusColor).Render("◉")) + m.style(accentColor).Bold(true).Render(" scry ")
+
+	done, total := m.options.Mail.SyncProgress()
+
+	if m.networkActive > 0 && total > 0 {
+		logo += m.style(yellowColor).Render(fmt.Sprintf("%d%% ", done*100/total))
+	}
+
+	searchWidth := min(48, m.width/2)
+
+	searchText := m.search.View()
+	if !m.searchFocused && m.search.Value() == "" {
+		searchText = m.style(mutedColor).Render("Search all mail")
+	}
+
+	searchBorder := mutedColor
+	if m.searchFocused {
+		searchBorder = accentColor
+	}
+
+	searchBox := m.zones.Mark("search", m.style(searchBorder).Render("/ ")+fit(searchText, searchWidth-2))
+
+	draftButton := ""
+	if m.draft != nil && !m.draftVisible {
+		draftButton = m.button("w", "draft") + " "
+	}
+
+	notice := m.notice
+	if m.sending {
+		notice = fmt.Sprintf("Sending in %ds. Press u to undo.", m.sendRemaining)
+	}
+
+	if m.delivering {
+		notice = "Sending..."
+	}
+
+	noticeWidth := m.width - lipgloss.Width(logo) - searchWidth - lipgloss.Width(draftButton) - 4
+	noticeText := lipgloss.PlaceHorizontal(max(0, noticeWidth), lipgloss.Right, m.style(mutedColor).Render(ansi.Truncate(notice, max(0, noticeWidth), "…")))
+
+	topBar := logo + " " + searchBox + "  " + noticeText + " " + draftButton
+
+	innerHeight := m.panesHeight() - 2
+	folderInnerWidth := folderPaneWidth - 2
+
+	var folderLines []string
+	selectedLine := 0
+	previousAccount := "-"
+
+	for i, row := range m.folderRows {
+		if row.account != previousAccount && row.account != "" {
+			folderLines = append(folderLines, "", " "+m.style(m.accountColor(row.account)).Bold(true).Render(row.account))
+		}
+
+		previousAccount = row.account
+
+		label := row.folder
+		if row.account == "" {
+			label = "All inboxes"
+		}
+
+		count := ""
+		if m.unreadCounts[i] > 0 {
+			count = strconv.Itoa(m.unreadCounts[i])
+		}
+
+		indent := "  "
+		if row.account == "" {
+			indent = " "
+		}
+
+		text := indent + label
+		gap := max(1, folderInnerWidth-2-lipgloss.Width(text)-len(count))
+
+		marker := "  "
+		style := lipgloss.NewStyle()
+
+		if i == m.folderIndex && m.search.Value() == "" {
+			selectedLine = len(folderLines)
+			markerColor := mutedColor
+			if m.focus == folderPane && !m.draftVisible {
+				markerColor = m.accountColor(row.account)
+			}
+
+			marker = m.style(markerColor).Render("▌") + " "
+			style = style.Foreground(m.paint(markerColor)).Bold(true)
+		}
+
+		line := marker + style.Render(text) + strings.Repeat(" ", gap) + m.style(m.accountColor(row.account)).Render(count)
+
+		folderLines = append(folderLines, m.zones.Mark(fmt.Sprintf("folder:%d", i), fit(line, folderInnerWidth)))
+	}
+
+	folderOffset := max(0, min(selectedLine-innerHeight/2, len(folderLines)-innerHeight))
+	visibleFolders := folderLines[folderOffset:min(len(folderLines), folderOffset+innerHeight)]
+
+	folderBorder := mutedColor
+	if m.focus == folderPane && !m.draftVisible && !m.searchFocused {
+		folderBorder = accentColor
+	}
+
+	folderBox := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(m.paint(folderBorder)).Width(folderInnerWidth + 2).Height(innerHeight + 2)
+	folders := m.zones.Mark("pane:folders", folderBox.Render(strings.Join(visibleFolders, "\n")))
+
+	rightInnerWidth := m.width - folderPaneWidth - 2
+
+	var rightPane string
+
+	if m.draftVisible && m.draft != nil {
+		draft := m.draft
+		labelStyle := m.style(mutedColor).Width(10)
+
+		lines := []string{
+			" " + boldStyle.Render("Draft") + m.style(mutedColor).Render("  from ") + m.style(m.accountColor(draft.Account)).Bold(true).Render(draft.Account),
+			"",
+			" " + labelStyle.Render("To") + fit(draft.To, rightInnerWidth-12),
+			" " + labelStyle.Render("Subject") + fit(draft.Subject, rightInnerWidth-12),
+		}
+
+		for i, path := range draft.Attach {
+			label := ""
+			if i == 0 {
+				label = "Attach"
+			}
+
+			status := ""
+			if slices.Contains(m.missingAttachments, path) {
+				status = m.style(redColor).Render("  not found")
+			}
+
+			lines = append(lines, " "+labelStyle.Render(label)+path+status)
+		}
+
+		lines = append(lines, " "+m.style(mutedColor).Render(strings.Repeat("─", rightInnerWidth-2)))
+
+		statusLines := 0
+		if m.draftError != "" {
+			statusLines = 2
+		}
+
+		if m.sending || m.delivering {
+			statusLines = 3
+		}
+
+		bodyHeight := max(0, innerHeight-len(lines)-statusLines)
+		body := lipgloss.NewStyle().Width(rightInnerWidth - 2).Render(draft.Body)
+		bodyLines := strings.Split(body, "\n")
+
+		for _, line := range bodyLines[:min(len(bodyLines), bodyHeight)] {
+			lines = append(lines, " "+line)
+		}
+
+		for len(lines) < innerHeight-statusLines {
+			lines = append(lines, "")
+		}
+
+		switch {
+		case m.delivering:
+			lines = append(lines, "", " "+m.style(yellowColor).Render("Sending..."), "")
+
+		case m.sending:
+			barWidth := min(40, rightInnerWidth-4)
+			filled := barWidth * (sendDelay - m.sendRemaining) / sendDelay
+			bar := m.style(yellowColor).Render(strings.Repeat("━", filled)) + m.style(mutedColor).Render(strings.Repeat("━", barWidth-filled))
+			lines = append(lines, "", " "+m.style(yellowColor).Bold(true).Render(fmt.Sprintf("Sending in %ds", m.sendRemaining))+"   "+m.button("u", "undo"), " "+bar)
+
+		case m.draftError != "":
+			lines = append(lines, "", " "+m.style(redColor).Render(ansi.Truncate(m.draftError, rightInnerWidth-2, "…")))
+		}
+
+		box := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(m.paint(m.accountColor(draft.Account))).Width(rightInnerWidth + 2).Height(innerHeight + 2)
+
+		rightPane = box.Render(strings.Join(lines[:min(len(lines), innerHeight)], "\n"))
+	} else {
+		row := m.folderRows[m.folderIndex]
+
+		title := row.folder
+		switch {
+		case m.search.Value() != "":
+			title = "Search results"
+
+		case row.account == "":
+			title = "All inboxes"
+
+		default:
+			title = row.account + " · " + row.folder
+		}
+
+		lines := []string{" " + boldStyle.Render(title) + m.style(mutedColor).Render(fmt.Sprintf("  %d", len(m.messages))), ""}
+
+		showAccount := m.search.Value() != "" || row.account == ""
+		showFolder := m.search.Value() != ""
+
+		accountWidth := 0
+		for _, account := range m.accounts {
+			accountWidth = max(accountWidth, lipgloss.Width(account.Name))
+		}
+
+		folderWidth := 9
+
+		fromWidth := max(12, min(24, rightInnerWidth/4))
+		dateWidth := 6
+
+		subjectWidth := rightInnerWidth - 3 - fromWidth - 2 - 2 - dateWidth - 1
+		if showAccount {
+			subjectWidth -= accountWidth + 2
+		}
+
+		if showFolder {
+			subjectWidth -= folderWidth + 2
+		}
+
+		if len(m.messages) == 0 {
+			empty := "Nothing here"
+			if m.search.Value() != "" {
+				empty = "No matches"
+			}
+
+			lines = append(lines, "", lipgloss.PlaceHorizontal(rightInnerWidth, lipgloss.Center, m.style(mutedColor).Render(empty)))
+		}
+
+		focused := m.focus == listPane && !m.searchFocused
+		now := time.Now()
+
+		for i := m.listOffset; i < min(len(m.messages), m.listOffset+m.listRows()); i++ {
+			message := m.messages[i]
+
+			marker := " "
+			textStyle := lipgloss.NewStyle()
+
+			if i == m.messageIndex {
+				markerColor := mutedColor
+				if focused {
+					markerColor = m.accountColor(message.Account)
+				}
+
+				marker = m.style(markerColor).Render("▌")
+				textStyle = textStyle.Foreground(m.paint(markerColor))
+			}
+
+			unread := " "
+			if message.Unread {
+				unread = m.style(m.accountColor(message.Account)).Render("●")
+				textStyle = textStyle.Bold(true)
+			}
+
+			subject := message.Subject
+
+			if subject == "" {
+				subject = "(no subject)"
+			}
+
+			attachmentMark := ""
+			if len(message.Attachments) > 0 {
+				attachmentMark = " " + m.style(mutedColor).Render("◈")
+			}
+
+			subjectText := textStyle.Render(ansi.Truncate(subject, max(1, subjectWidth-2), "…")) + attachmentMark
+
+			line := marker + unread + " " + fit(textStyle.Render(ansi.Truncate(message.From.Short(), fromWidth, "…")), fromWidth) + "  " + fit(subjectText, subjectWidth)
+
+			if showFolder {
+				line += "  " + fit(m.style(mutedColor).Render(message.Folder), folderWidth)
+			}
+
+			if showAccount {
+				line += "  " + fit(m.style(m.accountColor(message.Account)).Render(message.Account), accountWidth)
+			}
+
+			date := message.Date.Format("Jan 06")
+
+			switch {
+			case message.Date.Year() == now.Year() && message.Date.YearDay() == now.YearDay():
+				date = message.Date.Format("15:04")
+
+			case now.Sub(message.Date) < 6*24*time.Hour:
+				date = message.Date.Format("Mon")
+
+			case message.Date.Year() == now.Year():
+				date = message.Date.Format("2 Jan")
+			}
+
+			line += "  " + lipgloss.PlaceHorizontal(dateWidth, lipgloss.Right, m.style(mutedColor).Render(date))
+
+			lines = append(lines, m.zones.Mark(fmt.Sprintf("message:%d", i), fit(line, rightInnerWidth)))
+		}
+
+		borderColor := mutedColor
+		if focused {
+			borderColor = accentColor
+		}
+
+		box := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(m.paint(borderColor)).Width(rightInnerWidth + 2).Height(innerHeight + 2)
+
+		rightPane = m.zones.Mark("pane:list", box.Render(strings.Join(lines, "\n")))
+	}
+
+	middle := lipgloss.JoinHorizontal(lipgloss.Top, folders, rightPane)
 
 	switch m.popup {
 	case movePopup:
@@ -1064,349 +1377,31 @@ func (m *Model) View() tea.View {
 		middle = overlay(middle, m.popupBox(lines, boxWidth))
 	}
 
-	view.SetContent(m.zones.Scan(lipgloss.JoinVertical(lipgloss.Left, m.topBar(), middle, m.footer())))
-
-	return view
-}
-
-func (m *Model) topBar() string {
-	statusColor := accentColor
-	switch {
-	case m.networkActive > 0:
-		statusColor = yellowColor
-
-	case m.networkError != "":
-		statusColor = redColor
-	}
-
-	title := " " + m.zones.Mark("key:L", m.style(statusColor).Render("◉")) + m.style(accentColor).Bold(true).Render(" scry ")
-
-	if done, total := m.options.Mail.SyncProgress(); m.networkActive > 0 && total > 0 {
-		title += m.style(yellowColor).Render(fmt.Sprintf("%d%% ", done*100/total))
-	}
-
-	searchWidth := min(48, m.width/2)
-
-	searchText := m.search.View()
-	if !m.searchFocused && m.search.Value() == "" {
-		searchText = m.style(mutedColor).Render("Search all mail")
-	}
-
-	searchBorder := mutedColor
-	if m.searchFocused {
-		searchBorder = accentColor
-	}
-
-	searchBox := m.zones.Mark("search", m.style(searchBorder).Render("/ ")+fit(searchText, searchWidth-2))
-
-	right := ""
-	if m.draft != nil && !m.draftVisible {
-		right = m.button("w", "draft") + " "
-	}
-
-	notice := m.notice
-	if m.sending {
-		notice = fmt.Sprintf("Sending in %ds. Press u to undo.", m.sendRemaining)
-	}
-
-	if m.delivering {
-		notice = "Sending..."
-	}
-
-	noticeWidth := m.width - lipgloss.Width(title) - searchWidth - lipgloss.Width(right) - 4
-	noticeText := lipgloss.PlaceHorizontal(max(0, noticeWidth), lipgloss.Right, m.style(mutedColor).Render(ansi.Truncate(notice, max(0, noticeWidth), "…")))
-
-	return title + " " + searchBox + "  " + noticeText + " " + right
-}
-
-func (m *Model) folderView(height int) string {
-	innerWidth := folderPaneWidth - 2
-	innerHeight := height - 2
-
-	var lines []string
-	selectedLine := 0
-	previousAccount := "-"
-
-	for i, row := range m.folderRows {
-		if row.account != previousAccount && row.account != "" {
-			lines = append(lines, "", " "+m.style(m.accountColor(row.account)).Bold(true).Render(row.account))
-		}
-
-		previousAccount = row.account
-
-		label := row.folder
-		if row.account == "" {
-			label = "All inboxes"
-		}
-
-		count := ""
-		if unread := m.options.Mail.Unread(row.account, row.folder); unread > 0 {
-			count = strconv.Itoa(unread)
-		}
-
-		indent := "  "
-		if row.account == "" {
-			indent = " "
-		}
-
-		text := indent + label
-		gap := max(1, innerWidth-2-lipgloss.Width(text)-len(count))
-
-		marker := "  "
-		style := lipgloss.NewStyle()
-
-		if i == m.folderIndex && m.search.Value() == "" {
-			selectedLine = len(lines)
-			markerColor := mutedColor
-			if m.focus == folderPane && !m.draftVisible {
-				markerColor = m.accountColor(row.account)
-			}
-
-			marker = m.style(markerColor).Render("▌") + " "
-			style = style.Foreground(m.paint(markerColor)).Bold(true)
-		}
-
-		line := marker + style.Render(text) + strings.Repeat(" ", gap) + m.style(m.accountColor(row.account)).Render(count)
-
-		lines = append(lines, m.zones.Mark(fmt.Sprintf("folder:%d", i), fit(line, innerWidth)))
-	}
-
-	offset := max(0, min(selectedLine-innerHeight/2, len(lines)-innerHeight))
-	visible := lines[offset:min(len(lines), offset+innerHeight)]
-
-	borderColor := mutedColor
-	if m.focus == folderPane && !m.draftVisible && !m.searchFocused {
-		borderColor = accentColor
-	}
-
-	box := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(m.paint(borderColor)).Width(innerWidth + 2).Height(innerHeight + 2)
-
-	return m.zones.Mark("pane:folders", box.Render(strings.Join(visible, "\n")))
-}
-
-func (m *Model) rightView(width, height int) string {
-	innerWidth := width - 2
-	innerHeight := height - 2
-
-	if m.draftVisible && m.draft != nil {
-		return m.draftView(innerWidth, innerHeight)
-	}
-
-	row := m.folderRows[m.folderIndex]
-
-	title := row.folder
-	switch {
-	case m.search.Value() != "":
-		title = "Search results"
-
-	case row.account == "":
-		title = "All inboxes"
-
-	default:
-		title = row.account + " · " + row.folder
-	}
-
-	lines := []string{" " + boldStyle.Render(title) + m.style(mutedColor).Render(fmt.Sprintf("  %d", len(m.messages))), ""}
-
-	showAccount := m.search.Value() != "" || row.account == ""
-	showFolder := m.search.Value() != ""
-
-	accountWidth := 0
-	for _, account := range m.accounts {
-		accountWidth = max(accountWidth, lipgloss.Width(account.Name))
-	}
-
-	folderWidth := 9
-
-	fromWidth := max(12, min(24, innerWidth/4))
-	dateWidth := 6
-
-	subjectWidth := innerWidth - 3 - fromWidth - 2 - 2 - dateWidth - 1
-	if showAccount {
-		subjectWidth -= accountWidth + 2
-	}
-
-	if showFolder {
-		subjectWidth -= folderWidth + 2
-	}
-
-	if len(m.messages) == 0 {
-		empty := "Nothing here"
-		if m.search.Value() != "" {
-			empty = "No matches"
-		}
-
-		lines = append(lines, "", lipgloss.PlaceHorizontal(innerWidth, lipgloss.Center, m.style(mutedColor).Render(empty)))
-	}
-
-	focused := m.focus == listPane && !m.searchFocused
-	now := time.Now()
-
-	for i := m.listOffset; i < min(len(m.messages), m.listOffset+m.listRows()); i++ {
-		message := m.messages[i]
-
-		marker := " "
-		textStyle := lipgloss.NewStyle()
-
-		if i == m.messageIndex {
-			markerColor := mutedColor
-			if focused {
-				markerColor = m.accountColor(message.Account)
-			}
-
-			marker = m.style(markerColor).Render("▌")
-			textStyle = textStyle.Foreground(m.paint(markerColor))
-		}
-
-		unread := " "
-		if message.Unread {
-			unread = m.style(m.accountColor(message.Account)).Render("●")
-			textStyle = textStyle.Bold(true)
-		}
-
-		subject := message.Subject
-		if subject == "" {
-			subject = "(no subject)"
-		}
-
-		attachmentMark := ""
-		if len(message.Attachments) > 0 {
-			attachmentMark = " " + m.style(mutedColor).Render("◈")
-		}
-
-		subjectText := textStyle.Render(ansi.Truncate(subject, max(1, subjectWidth-2), "…")) + attachmentMark
-
-		line := marker + unread + " " + fit(textStyle.Render(ansi.Truncate(message.From.Short(), fromWidth, "…")), fromWidth) + "  " + fit(subjectText, subjectWidth)
-
-		if showFolder {
-			line += "  " + fit(m.style(mutedColor).Render(message.Folder), folderWidth)
-		}
-
-		if showAccount {
-			line += "  " + fit(m.style(m.accountColor(message.Account)).Render(message.Account), accountWidth)
-		}
-
-		date := message.Date.Format("Jan 06")
-
-		switch {
-		case message.Date.Year() == now.Year() && message.Date.YearDay() == now.YearDay():
-			date = message.Date.Format("15:04")
-
-		case now.Sub(message.Date) < 6*24*time.Hour:
-			date = message.Date.Format("Mon")
-
-		case message.Date.Year() == now.Year():
-			date = message.Date.Format("2 Jan")
-		}
-
-		line += "  " + lipgloss.PlaceHorizontal(dateWidth, lipgloss.Right, m.style(mutedColor).Render(date))
-
-		lines = append(lines, m.zones.Mark(fmt.Sprintf("message:%d", i), fit(line, innerWidth)))
-	}
-
-	borderColor := mutedColor
-	if focused {
-		borderColor = accentColor
-	}
-
-	box := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(m.paint(borderColor)).Width(innerWidth + 2).Height(innerHeight + 2)
-
-	return m.zones.Mark("pane:list", box.Render(strings.Join(lines, "\n")))
-}
-
-func (m *Model) draftView(innerWidth, innerHeight int) string {
-	draft := m.draft
-	labelStyle := m.style(mutedColor).Width(10)
-
-	lines := []string{
-		" " + boldStyle.Render("Draft") + m.style(mutedColor).Render("  from ") + m.style(m.accountColor(draft.Account)).Bold(true).Render(draft.Account),
-		"",
-		" " + labelStyle.Render("To") + fit(draft.To, innerWidth-12),
-		" " + labelStyle.Render("Subject") + fit(draft.Subject, innerWidth-12),
-	}
-
-	for i, path := range draft.Attach {
-		label := ""
-		if i == 0 {
-			label = "Attach"
-		}
-
-		status := ""
-		if _, err := os.Stat(expandHome(path)); err != nil {
-			status = m.style(redColor).Render("  not found")
-		}
-
-		lines = append(lines, " "+labelStyle.Render(label)+path+status)
-	}
-
-	lines = append(lines, " "+m.style(mutedColor).Render(strings.Repeat("─", innerWidth-2)))
-
-	footerLines := 0
-	if m.draftError != "" {
-		footerLines = 2
-	}
-
-	if m.sending || m.delivering {
-		footerLines = 3
-	}
-
-	bodyHeight := max(0, innerHeight-len(lines)-footerLines)
-	body := lipgloss.NewStyle().Width(innerWidth - 2).Render(draft.Body)
-	bodyLines := strings.Split(body, "\n")
-
-	for _, line := range bodyLines[:min(len(bodyLines), bodyHeight)] {
-		lines = append(lines, " "+line)
-	}
-
-	for len(lines) < innerHeight-footerLines {
-		lines = append(lines, "")
-	}
-
-	switch {
-	case m.delivering:
-		lines = append(lines, "", " "+m.style(yellowColor).Render("Sending..."), "")
-
-	case m.sending:
-		barWidth := min(40, innerWidth-4)
-		filled := barWidth * (sendDelay - m.sendRemaining) / sendDelay
-		bar := m.style(yellowColor).Render(strings.Repeat("━", filled)) + m.style(mutedColor).Render(strings.Repeat("━", barWidth-filled))
-		lines = append(lines, "", " "+m.style(yellowColor).Bold(true).Render(fmt.Sprintf("Sending in %ds", m.sendRemaining))+"   "+m.button("u", "undo"), " "+bar)
-
-	case m.draftError != "":
-		lines = append(lines, "", " "+m.style(redColor).Render(ansi.Truncate(m.draftError, innerWidth-2, "…")))
-	}
-
-	box := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(m.paint(m.accountColor(draft.Account))).Width(innerWidth + 2).Height(innerHeight + 2)
-
-	return box.Render(strings.Join(lines[:min(len(lines), innerHeight)], "\n"))
-}
-
-func (m *Model) footer() string {
-	var rows [][]string
+	var footerRows [][]string
 
 	switch {
 	case m.popup == movePopup:
-		rows = [][]string{{m.button("enter", "move"), m.button("esc", "cancel")}}
+		footerRows = [][]string{{m.button("enter", "move"), m.button("esc", "cancel")}}
 
 	case m.popup == discardPopup:
-		rows = [][]string{{m.button("y", "discard"), m.button("n", "keep")}}
+		footerRows = [][]string{{m.button("y", "discard"), m.button("n", "keep")}}
 
 	case m.popup == logPopup:
-		rows = [][]string{{m.button("esc", "close")}}
+		footerRows = [][]string{{m.button("esc", "close")}}
 
 	case m.sending:
-		rows = [][]string{{m.button("u", "undo send")}}
+		footerRows = [][]string{{m.button("u", "undo send")}}
 
 	case m.delivering:
 
 	case m.draftVisible:
-		rows = [][]string{{m.button("e", "edit"), m.button("s", "send"), m.button("h", "hide"), m.button("x", "discard")}}
+		footerRows = [][]string{{m.button("e", "edit"), m.button("s", "send"), m.button("h", "hide"), m.button("x", "discard")}}
 
 	case m.searchFocused:
-		rows = [][]string{{m.button("enter", "browse results"), m.button("esc", "clear search")}}
+		footerRows = [][]string{{m.button("enter", "browse results"), m.button("esc", "clear search")}}
 
 	default:
-		rows = [][]string{
+		footerRows = [][]string{
 			{
 				m.button("A", "archive"), m.button("M", "move"), m.button("!", "spam"), m.button("D", "delete"),
 				m.button("r", "reply all"), m.button("R", "reply"),
@@ -1419,7 +1414,7 @@ func (m *Model) footer() string {
 	}
 
 	var columnWidths []int
-	for _, buttons := range rows {
+	for _, buttons := range footerRows {
 		for column, button := range buttons {
 			if column == len(columnWidths) {
 				columnWidths = append(columnWidths, 0)
@@ -1437,13 +1432,15 @@ func (m *Model) footer() string {
 	gaps := max(1, len(columnWidths)-1)
 	base, extra := 1, 0
 
-	if spacing := m.width - 2 - textWidth; spacing > gaps {
+	spacing := m.width - 2 - textWidth
+
+	if spacing > gaps {
 		base, extra = spacing/gaps, spacing%gaps
 	}
 
-	lines := []string{"", ""}
+	footerLines := []string{"", ""}
 
-	for row, buttons := range rows {
+	for row, buttons := range footerRows {
 		var bar strings.Builder
 
 		for column, button := range buttons {
@@ -1459,14 +1456,19 @@ func (m *Model) footer() string {
 			}
 		}
 
-		lines[row] = " " + ansi.Truncate(bar.String(), m.width-2, "")
+		footerLines[row] = " " + ansi.Truncate(bar.String(), m.width-2, "")
 	}
 
-	return strings.Join(lines, "\n")
+	footer := strings.Join(footerLines, "\n")
+
+	view.SetContent(m.zones.Scan(lipgloss.JoinVertical(lipgloss.Left, topBar, middle, footer)))
+
+	return view
 }
 
 func (m *Model) accountColor(name string) adaptiveColor {
 	index := slices.IndexFunc(m.accounts, func(account mailbox.Account) bool { return account.Name == name })
+
 	if index < 0 {
 		return accentColor
 	}
@@ -1506,6 +1508,7 @@ func overlay(background, box string) string {
 
 	for i, boxLine := range boxLines {
 		row := top + i
+
 		if row >= len(backgroundLines) {
 			break
 		}
@@ -1529,6 +1532,7 @@ func fit(text string, width int) string {
 
 func expandHome(path string) string {
 	rest, ok := strings.CutPrefix(path, "~/")
+
 	if !ok {
 		return path
 	}

@@ -16,7 +16,9 @@ type Log struct {
 }
 
 func Open(directory string, keepDays int) (*Log, error) {
-	if err := os.MkdirAll(directory, 0o700); err != nil {
+	err := os.MkdirAll(directory, 0o700)
+
+	if err != nil {
 		return nil, err
 	}
 
@@ -35,7 +37,9 @@ func Open(directory string, keepDays int) (*Log, error) {
 			continue
 		}
 
-		if err := os.Remove(filepath.Join(directory, entry.Name())); err != nil {
+		err = os.Remove(filepath.Join(directory, entry.Name()))
+
+		if err != nil {
 			return nil, err
 		}
 	}
