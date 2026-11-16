@@ -1,0 +1,187 @@
+package mailbox
+
+import (
+	"slices"
+	"strings"
+)
+
+type searchTerm struct {
+	field string
+	value string
+}
+
+func Search(messages []Message, query string) []Message {
+	var terms []searchTerm
+
+	for _, word := range splitQuery(query) {
+		field, value, found := strings.Cut(word, ":")
+
+		switch {
+		case found && (field == "subject" || field == "body" || field == "person") && value != "":
+			terms = append(terms, searchTerm{field: field, value: strings.ToLower(value)})
+
+		default:
+			terms = append(terms, searchTerm{value: strings.ToLower(word)})
+		}
+	}
+
+	if len(terms) == 0 {
+		return nil
+	}
+
+	type scored struct {
+		message Message
+		score   int
+	}
+
+	var results []scored
+
+	for _, message := range messages {
+		total := 0
+
+		for _, term := range terms {
+			subjectScore := matchScore(message.Subject, term.value)
+
+			personScore := matchScore(message.From.Name, term.value)
+			personScore = max(personScore, matchScore(message.From.Email, term.value))
+
+			for _, recipient := range message.To {
+				personScore = max(personScore, matchScore(recipient.Name, term.value))
+				personScore = max(personScore, matchScore(recipient.Email, term.value))
+			}
+
+			bodyScore := 0
+			if strings.Contains(strings.ToLower(message.Text), term.value) {
+				bodyScore = 50
+			}
+
+			var termScore int
+
+			switch term.field {
+			case "subject":
+				termScore = subjectScore
+
+			case "person":
+				termScore = personScore
+
+			case "body":
+				termScore = bodyScore
+
+			default:
+				termScore = max(subjectScore, personScore, bodyScore)
+			}
+
+			if termScore == 0 {
+				total = 0
+				break
+			}
+
+			total += termScore
+		}
+
+		if total > 0 {
+			results = append(results, scored{message: message, score: total})
+		}
+	}
+
+	slices.SortStableFunc(results, func(a, b scored) int {
+		if a.score != b.score {
+			return b.score - a.score
+		}
+
+		return b.message.Date.Compare(a.message.Date)
+	})
+
+	found := make([]Message, len(results))
+	for i, result := range results {
+		found[i] = result.message
+	}
+
+	return found
+}
+
+func splitQuery(query string) []string {
+	var words []string
+	var current strings.Builder
+
+	quoted := false
+
+	for _, character := range query {
+		switch {
+		case character == '"':
+			quoted = !quoted
+
+		case character == ' ' && !quoted:
+			if current.Len() > 0 {
+				words = append(words, current.String())
+				current.Reset()
+			}
+
+		default:
+			current.WriteRune(character)
+		}
+	}
+
+	if current.Len() > 0 {
+		words = append(words, current.String())
+	}
+
+	return words
+}
+
+func matchScore(text, value string) int {
+	text = strings.ToLower(text)
+
+	index := strings.Index(text, value)
+
+	wordStart := index == 0
+	if index > 0 {
+		previous := text[index-1]
+		wordStart = !(previous >= 'a' && previous <= 'z') && !(previous >= '0' && previous <= '9')
+	}
+
+	switch {
+	case wordStart:
+		return 120
+
+	case index > 0:
+		return 100
+
+	case len([]rune(value)) < 3:
+		return 0
+	}
+
+	valueRunes := []rune(value)
+	matched := 0
+	start := -1
+	end := -1
+
+	for position, character := range []rune(text) {
+		if matched == len(valueRunes) {
+			break
+		}
+
+		if character != valueRunes[matched] {
+			continue
+		}
+
+		if start < 0 {
+			start = position
+		}
+
+		end = position
+		matched++
+	}
+
+	if matched < len(valueRunes) {
+		return 0
+	}
+
+	gaps := (end - start + 1) - len(valueRunes)
+
+	if gaps > 2 {
+		return 0
+	}
+
+	return 60 - gaps*10
+}

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>scry</title>
+<style>
+:root {
+  --background: #f6f4fa;
+  --surface: #ffffff;
+  --text: #1f1d24;
+  --muted: #6b6578;
+  --border: #e4dfee;
+  --accent: #7a4fd6;
+  --accent-soft: #efe8fc;
+}
+body { --account: var(--account-light, var(--accent)); }
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #16141b;
+    --surface: #1f1c26;
+    --text: #ece8f4;
+    --muted: #9a93a8;
+    --border: #2f2a3a;
+    --accent: #b493ff;
+    --accent-soft: #2c2340;
+  }
+  body { --account: var(--account-dark, var(--accent)); }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--background);
+  color: var(--text);
+  font: 14px/1.45 system-ui, sans-serif;
+}
+header {
+  padding: 18px 24px 14px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  border-top: 3px solid var(--account);
+}
+h1 {
+  margin: 0 0 8px;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  color: var(--muted);
+}
+.meta b { color: var(--text); font-weight: 500; }
+.account {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 99px;
+  background: color-mix(in srgb, var(--account) 16%, transparent);
+  color: var(--account);
+  font-size: 12px;
+  font-weight: 600;
+}
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+.attachments:empty { display: none; }
+.attachments a {
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  text-decoration: none;
+}
+.attachments a:hover { border-color: var(--accent); color: var(--accent); }
+.attachments span { color: var(--muted); margin-left: 6px; }
+iframe {
+  flex: 1;
+  width: 100%;
+  border: 0;
+  background: #ffffff;
+}
+.state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--muted);
+}
+.state strong {
+  font-size: 28px;
+  letter-spacing: 6px;
+  color: var(--accent);
+  font-weight: 300;
+}
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="state" id="state"><strong>scry</strong><span id="state-text">Select an email in scry</span></div>
+<header id="header" hidden>
+  <h1 id="subject"></h1>
+  <div class="meta">
+    <span class="account" id="account"></span>
+    <span>From <b id="from"></b></span>
+    <span>To <b id="to"></b></span>
+    <span id="date"></span>
+  </div>
+  <div class="attachments" id="attachments"></div>
+</header>
+<iframe id="body" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" hidden></iframe>
+<script src="app.js"></script>
+</body>
+</html>

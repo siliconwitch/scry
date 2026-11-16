@@ -1,0 +1,8 @@
+# Copy to ~/.config/scry/config.toml.
+
+# Browser command that opens the viewer when scry starts. %s is the viewer's
+# address. Leave it out and scry shows the address to open yourself.
+viewer = "chromium --app=%s"
+
+# Days to keep sync logs in ~/.local/state/scry/logs.
+log-days = 7
