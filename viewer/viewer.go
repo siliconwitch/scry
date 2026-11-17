@@ -1,8 +1,11 @@
 package viewer
 
 import (
+	"archive/zip"
+	"bytes"
 	"crypto/rand"
 	"embed"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -17,11 +20,15 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
+	"github.com/yuin/goldmark"
 	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
 )
 
-//go:embed page.html app.js pdfjs
+//go:generate sh vendor.sh
+//go:embed page.html app.js embedpdf ooxml
 var assets embed.FS
 
 type Attachment struct {
@@ -139,7 +146,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case path == "":
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'unsafe-inline'; frame-src 'self'; connect-src 'self'; img-src 'self' data:")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'unsafe-inline'; frame-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self'")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		content, _ := assets.ReadFile("page.html")
 
@@ -151,7 +158,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		w.Write(content)
 
-	case parts[0] == "pdfjs":
+	case parts[0] == "embedpdf" || parts[0] == "ooxml":
 		content, err := assets.ReadFile(path)
 
 		if err != nil {
@@ -165,7 +172,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			contentType = "application/octet-stream"
 		}
 
-		// The PDF worker takes its policy from this response, and decodes some images with WebAssembly.
+		// Each worker takes its policy from this response, and the parsers run as WebAssembly.
 		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'")
 		w.Header().Set("Content-Type", contentType)
 		w.Write(content)
@@ -227,7 +234,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				Name: attachment.Name,
 				Size: len(attachment.Data),
 				URL:  fmt.Sprintf("attachment/%d/%d", version, i),
-				Kind: viewableKinds[http.DetectContentType(attachment.Data)],
+				Kind: attachmentKind(attachment),
 			}
 
 			if info.Kind != "" {
@@ -370,17 +377,115 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		attachment := page.Attachments[index]
-		contentType := http.DetectContentType(attachment.Data)
+		kind := attachmentKind(attachment)
 
-		if viewableKinds[contentType] == "" {
+		if kind == "" {
 			http.NotFound(w, r)
 			return
 		}
 
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
-		w.Header().Set("Content-Type", contentType)
-		w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{"filename": attachment.Name}))
-		w.Write(attachment.Data)
+		if kind != "text" {
+			w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+			w.Header().Set("Content-Type", http.DetectContentType(attachment.Data))
+			w.Header().Set("Content-Disposition", mime.FormatMediaType("inline", map[string]string{"filename": attachment.Name}))
+
+			// A video seeks with range requests.
+			http.ServeContent(w, r, attachment.Name, time.Time{}, bytes.NewReader(attachment.Data))
+			return
+		}
+
+		var content strings.Builder
+
+		switch strings.ToLower(filepath.Ext(attachment.Name)) {
+		case ".csv":
+			reader := csv.NewReader(bytes.NewReader(attachment.Data))
+			reader.FieldsPerRecord = -1
+			reader.LazyQuotes = true
+
+			records, err := reader.ReadAll()
+
+			if err != nil {
+				http.Error(w, "This file can't be shown.", http.StatusInternalServerError)
+				return
+			}
+
+			content.WriteString("<table>")
+
+			for _, record := range records {
+				content.WriteString("<tr>")
+
+				for _, field := range record {
+					content.WriteString("<td>" + html.EscapeString(field) + "</td>")
+				}
+
+				content.WriteString("</tr>")
+			}
+
+			content.WriteString("</table>")
+
+		case ".md", ".markdown":
+			var rendered bytes.Buffer
+
+			err := goldmark.Convert(attachment.Data, &rendered)
+
+			if err != nil {
+				http.Error(w, "This file can't be shown.", http.StatusInternalServerError)
+				return
+			}
+
+			nodes, err := html.ParseFragment(&rendered, &html.Node{Type: html.ElementNode, Data: "body", DataAtom: atom.Body})
+
+			if err != nil {
+				http.Error(w, "This file can't be shown.", http.StatusInternalServerError)
+				return
+			}
+
+			for _, root := range nodes {
+				for node := range root.Descendants() {
+					if node.Type != html.ElementNode || node.Data != "a" {
+						continue
+					}
+
+					href := ""
+
+					node.Attr = slices.DeleteFunc(node.Attr, func(attribute html.Attribute) bool {
+						isHref := attribute.Key == "href"
+
+						if isHref {
+							href = attribute.Val
+						}
+
+						return isHref
+					})
+
+					address, err := url.Parse(strings.TrimSpace(href))
+
+					if err != nil || (address.Scheme != "http" && address.Scheme != "https") || address.Host == "" {
+						continue
+					}
+
+					// The open path answers with no content, which keeps the file in its frame.
+					node.Attr = append(node.Attr,
+						html.Attribute{Key: "href", Val: "/" + s.token + "/open?url=" + url.QueryEscape(address.String())},
+						html.Attribute{Key: "title", Val: address.String()})
+				}
+
+				html.Render(&content, root)
+			}
+
+		default:
+			content.WriteString("<pre>" + html.EscapeString(string(attachment.Data)) + "</pre>")
+		}
+
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; font-src data:; img-src data:; sandbox")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!doctype html><html><head><style>`,
+			`body{margin:0;padding:28px 32px;background:#fff;color:#1f1d24;font:16px/1.6 system-ui,sans-serif}`,
+			`pre{margin:0;white-space:pre-wrap;font:14px/1.5 ui-monospace,monospace}`,
+			`table{border-collapse:collapse;font-size:14px}`,
+			`td{border:1px solid #e4dfee;padding:4px 8px;vertical-align:top;white-space:pre-wrap}`,
+			`img{max-width:100%}`,
+			`</style></head><body>`, content.String(), `</body></html>`)
 
 	case len(parts) == 3 && parts[0] == "attachment":
 		s.mutex.Lock()
@@ -406,14 +511,48 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// The kinds the viewer shows in place, keyed by the type sniffed from the attachment's bytes, never its claimed type.
-var viewableKinds = map[string]string{
-	"application/pdf": "pdf",
-	"image/png":       "image",
-	"image/jpeg":      "image",
-	"image/gif":       "image",
-	"image/webp":      "image",
-	"image/bmp":       "image",
+// The kind the viewer shows an attachment as, from its bytes and never its claimed type. Only a text file's name picks its view.
+func attachmentKind(attachment Attachment) string {
+	contentType := http.DetectContentType(attachment.Data)
+
+	switch contentType {
+	case "application/pdf":
+		return "pdf"
+
+	case "image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp":
+		return "image"
+
+	case "video/mp4", "video/webm", "audio/mpeg", "audio/wave", "application/ogg":
+		return "media"
+
+	case "application/zip":
+		archive, err := zip.NewReader(bytes.NewReader(attachment.Data), int64(len(attachment.Data)))
+
+		if err != nil {
+			return ""
+		}
+
+		for _, file := range archive.File {
+			switch file.Name {
+			case "word/document.xml":
+				return "docx"
+
+			case "xl/workbook.xml":
+				return "xlsx"
+
+			case "ppt/presentation.xml":
+				return "pptx"
+			}
+		}
+
+		return ""
+	}
+
+	if strings.HasPrefix(contentType, "text/plain") {
+		return "text"
+	}
+
+	return ""
 }
 
 func (s *Server) notice(text string) {

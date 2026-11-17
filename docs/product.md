@@ -86,9 +86,17 @@ Everything you can see and do in scry. Anything not listed here is out.
 - The viewer header shows the sender and the To, Cc and Bcc recipients. Bcc
   shows when the email carries one, which is normally only email you sent.
   Clicking a name or address copies it.
-- The viewer lists attachments. Clicking an image or PDF shows it in place of
-  the email. Clicking any other attachment downloads it.
-- You can step through an email's images and PDFs without leaving the viewer.
+- The viewer lists attachments. Clicking one of these shows it in place of the
+  email:
+  - images and PDFs
+  - Word, Excel and PowerPoint files (docx, xlsx and pptx)
+  - video and audio clips
+  - text files, such as txt, csv and md
+- Clicking any other attachment downloads it.
+- Text in PDFs and Office files can be selected and copied. In a PDF, a double
+  click selects a word and a triple click selects a line.
+- You can step through an email's viewable attachments without leaving the
+  viewer.
 - Clicking a link in an email opens it with the browser command that `links`
   names in the config, such as `firefox %s`. Only `http` and `https` links
   open.
@@ -217,7 +225,7 @@ Everything scry does that you don't see or drive directly.
 - Scripts in email never run. The viewer shows images from the mirror and
   never contacts the network.
 - The viewer never opens a link itself. Links go to the `links` browser.
-- Scripts in a PDF never run.
+- Scripts and macros in attachments never run.
 
 ### Passwords
 

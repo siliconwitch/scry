@@ -257,17 +257,35 @@ every Go module update until the hash is updated.
 5. Commit `flake.nix` to the pull request branch with the message
    `Updated the Nix vendor hash`, and push.
 
-### pdf.js
+### The viewer's npm packages
 
-`viewer/pdfjs` holds pdf.js from the `pdfjs-dist` npm package. Dependabot
-doesn't track it, so check its version in `viewer/pdfjs/package.json` against
-npm when Raj asks for dependency updates. To update it, download the release
-tarball, check it against the `integrity` hash npm lists, and copy in:
+`viewer/vendor.sh` builds `viewer/embedpdf` (EmbedPDF, the PDF viewer) and
+`viewer/ooxml` (@silurus/ooxml, the Office viewer) from npm packages pinned with
+their integrity hashes. Never edit either directory by hand. Dependabot doesn't
+track them, so check the `fetch` versions in `vendor.sh` against npm when Raj
+asks for dependency updates.
 
-- `build/pdf.min.mjs` and `build/pdf.worker.min.mjs`
-- `cmaps`, `iccs` and `standard_fonts`
-- from `wasm`, everything except the QuickJS files, which run scripts in PDFs
-- `LICENSE` and `package.json`
+1. Look up the new version's integrity hash, and those of any changed
+   dependencies:
+
+   ```sh
+   curl -s https://registry.npmjs.org/<package>/<version> | jq -r '.dist.integrity, .dependencies'
+   ```
+
+2. Change the version and hash on its `fetch` line in `vendor.sh`.
+
+3. Rebuild both directories:
+
+   ```sh
+   nix develop -c go generate ./viewer
+   ```
+
+4. Check that the PDFium WASM still has no JavaScript engine. This prints
+   nothing when it has none:
+
+   ```sh
+   strings viewer/embedpdf/embedpdf.wasm | grep -E 'CJS_App|FXJS|v8::'
+   ```
 
 ### A vulnerability
 

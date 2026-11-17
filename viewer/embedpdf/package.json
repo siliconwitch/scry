@@ -1,0 +1,121 @@
+{
+  "name": "@embedpdf/engine",
+  "version": "3.3.0",
+  "private": false,
+  "description": "The EmbedPDF engine: opens, renders, searches, edits and saves PDF files in the browser and in Node, with one typed API.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.cts",
+  "exports": {
+    ".": {
+      "es2020": "./dist/portable.js",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./portable": {
+      "import": "./dist/portable.js",
+      "require": "./dist/portable.cjs"
+    },
+    "./package.json": "./package.json",
+    "./worker-entry": "./src/worker/worker-entry.ts",
+    "./worker-source": {
+      "types": "./workers/embedpdf-worker.source.d.ts",
+      "default": "./workers/embedpdf-worker.source.js"
+    },
+    "./dev-wasm": {
+      "types": "./workers/dev-wasm.d.ts",
+      "development": "./workers/dev-wasm.js",
+      "default": "./workers/dev-wasm.none.js"
+    },
+    "./workers/embedpdf-worker.js": "./workers/embedpdf-worker.js",
+    "./workers/encoder-worker.js": "./workers/encoder-worker.js",
+    "./workers/inline-transport.node.js": "./workers/inline-transport.node.js"
+  },
+  "imports": {
+    "#inline-transport": {
+      "node": "./workers/inline-transport.node.js",
+      "browser": "./workers/inline-transport.js",
+      "default": "./workers/inline-transport.node.js"
+    }
+  },
+  "files": [
+    "dist",
+    "workers",
+    "src/worker/worker-entry.ts",
+    "src/worker/bootstrap.ts",
+    "src/worker/protocol.ts",
+    "LICENSE",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/embedpdf/embed-pdf-viewer.git",
+    "directory": "packages/engine/main"
+  },
+  "homepage": "https://www.embedpdf.com",
+  "bugs": {
+    "url": "https://github.com/embedpdf/embed-pdf-viewer/issues"
+  },
+  "keywords": [
+    "pdf",
+    "embedpdf",
+    "engine",
+    "wasm"
+  ],
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@embedpdf/core-fonts": "3.3.0",
+    "@embedpdf/default-fallback-fonts": "1.0.1",
+    "@embedpdf/engine-core": "3.3.0",
+    "@embedpdf/engine-services": "3.3.0",
+    "@embedpdf/engine-runtime": "3.3.0",
+    "@embedpdf/engine-runtime-wasm32": "3.3.0"
+  },
+  "devDependencies": {
+    "@swc/core": "1.16.2",
+    "esbuild": "^0.28.1",
+    "harfbuzzjs": "1.6.2",
+    "rimraf": "^5.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^2.1.0",
+    "@embedpdf/tooling-build": "0.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "epdf": {
+    "rawExports": [
+      "./worker-entry",
+      "./worker-source",
+      "./dev-wasm",
+      "./workers/embedpdf-worker.js",
+      "./workers/encoder-worker.js",
+      "./workers/inline-transport.node.js"
+    ],
+    "devExports": "development",
+    "neverBundle": [
+      "#inline-transport",
+      "@embedpdf/engine/dev-wasm"
+    ],
+    "conditions": {
+      ".": {
+        "es2020": "./dist/portable.js"
+      }
+    }
+  },
+  "sideEffects": [
+    "./src/worker/worker-entry.ts",
+    "./workers/embedpdf-worker.js",
+    "./workers/encoder-worker.js"
+  ],
+  "scripts": {
+    "build": "node scripts/build-workers.mjs && epdf-build",
+    "clean": "rimraf dist workers",
+    "lint": "eslint src --color",
+    "lint:fix": "eslint src --color --fix",
+    "test": "vitest run",
+    "test:high-heap": "vitest run --config vitest.high-heap.config.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json"
+  }
+}
