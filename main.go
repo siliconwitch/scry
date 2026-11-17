@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,36 +63,93 @@ func main() {
 
 	settings := config{LogDays: 7, HistoryDays: 365}
 
-	_, err = toml.DecodeFile(configPath, &settings)
+	metadata, err := toml.DecodeFile(configPath, &settings)
 
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		fmt.Fprintln(os.Stderr, "scry: reading config:", err)
+	if errors.Is(err, fs.ErrNotExist) {
+		fmt.Fprintf(os.Stderr, "scry: there is no config at %s. Start from config.example.toml.\n", configPath)
 		os.Exit(1)
 	}
 
-	if len(settings.Accounts) == 0 {
-		fmt.Fprintln(os.Stderr, "scry: no [[account]] blocks in", configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "scry: reading %s: %v\n", configPath, err)
 		os.Exit(1)
+	}
+
+	var problems []string
+
+	for _, key := range metadata.Undecoded() {
+		problems = append(problems, fmt.Sprintf("%s isn't a setting.", key))
+	}
+
+	if settings.LogDays < 1 {
+		problems = append(problems, "log-days must be at least 1.")
+	}
+
+	if settings.HistoryDays < 1 {
+		problems = append(problems, "history-days must be at least 1.")
+	}
+
+	if len(settings.Accounts) == 0 {
+		problems = append(problems, "There are no [[account]] blocks.")
 	}
 
 	var accounts []mailbox.Account
 
-	accountByEmail := map[string]string{}
+	numberByName := map[string]int{}
+	numberByEmail := map[string]int{}
 
-	for _, account := range settings.Accounts {
-		email := strings.ToLower(account.Email)
-		existing, duplicate := accountByEmail[email]
+	for i, account := range settings.Accounts {
+		number := i + 1
 
-		if duplicate {
-			fmt.Fprintf(os.Stderr, "scry: %s and %s both use %s. Each account needs its own email.\n", existing, account.Name, account.Email)
-			os.Exit(1)
+		for _, field := range []struct{ key, value string }{{"name", account.Name}, {"email", account.Email}, {"imap", account.IMAP}, {"smtp", account.SMTP}, {"password-cmd", account.PasswordCommand}} {
+			if strings.TrimSpace(field.value) == "" {
+				problems = append(problems, fmt.Sprintf("Account %d has no %s.", number, field.key))
+			}
 		}
 
-		accountByEmail[email] = account.Name
+		for _, field := range []struct{ key, value, example string }{{"imap", account.IMAP, "imap.gmail.com:993"}, {"smtp", account.SMTP, "smtp.gmail.com:465"}} {
+			_, _, err := net.SplitHostPort(field.value)
 
-		if slices.Contains(account.Folders, mailbox.Outbox) {
-			fmt.Fprintf(os.Stderr, "scry: %s lists an %s folder, but scry keeps that name for unsent email. Remove it from folders.\n", account.Name, mailbox.Outbox)
-			os.Exit(1)
+			if field.value != "" && err != nil {
+				problems = append(problems, fmt.Sprintf("Account %d: %s needs a host and a port, such as %q.", number, field.key, field.example))
+			}
+		}
+
+		existing, duplicate := numberByName[account.Name]
+
+		if account.Name != "" && duplicate {
+			problems = append(problems, fmt.Sprintf("Accounts %d and %d are both called %q. Each account needs its own name.", existing, number, account.Name))
+		}
+
+		numberByName[account.Name] = number
+
+		email := strings.ToLower(account.Email)
+		existing, duplicate = numberByEmail[email]
+
+		if email != "" && duplicate {
+			problems = append(problems, fmt.Sprintf("Accounts %d and %d both use %s. Each account needs its own email.", existing, number, account.Email))
+		}
+
+		numberByEmail[email] = number
+
+		listed := map[string]bool{}
+
+		for _, folder := range account.Folders {
+			switch {
+			case strings.TrimSpace(folder) == "":
+				problems = append(problems, fmt.Sprintf("Account %d lists an empty folder name.", number))
+
+			case folder == mailbox.Outbox:
+				problems = append(problems, fmt.Sprintf("Account %d lists an %s folder, but scry keeps that name for unsent email.", number, mailbox.Outbox))
+
+			case slices.Contains([]string{mailbox.Inbox, mailbox.Sent, mailbox.Archive, mailbox.Spam, mailbox.Trash}, folder):
+				problems = append(problems, fmt.Sprintf("Account %d lists %s in folders, but every account already shows it.", number, folder))
+
+			case listed[folder]:
+				problems = append(problems, fmt.Sprintf("Account %d lists %s in folders twice.", number, folder))
+			}
+
+			listed[folder] = true
 		}
 
 		signature := account.Signature
@@ -102,6 +160,16 @@ func main() {
 		}
 
 		accounts = append(accounts, mailbox.Account{Name: account.Name, Email: account.Email, IMAP: account.IMAP, SMTP: account.SMTP, Signature: signature, PasswordCommand: account.PasswordCommand, Folders: account.Folders, HideFromCombinedInbox: account.CombinedInbox != nil && !*account.CombinedInbox})
+	}
+
+	if len(problems) > 0 {
+		fmt.Fprintf(os.Stderr, "scry: %s has problems, so scry can't start:\n", configPath)
+
+		for _, problem := range problems {
+			fmt.Fprintln(os.Stderr, "  "+problem)
+		}
+
+		os.Exit(1)
 	}
 
 	stateDirectory := os.Getenv("XDG_STATE_HOME")

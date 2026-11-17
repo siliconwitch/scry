@@ -192,7 +192,7 @@ func (s *Session) Folders() ([]Folder, error) {
 		return nil, err
 	}
 
-	specialUses := []imap.MailboxAttr{imap.MailboxAttrAll, imap.MailboxAttrArchive, imap.MailboxAttrDrafts, imap.MailboxAttrFlagged, imap.MailboxAttrJunk, imap.MailboxAttrSent, imap.MailboxAttrTrash}
+	specialUses := []imap.MailboxAttr{imap.MailboxAttrArchive, imap.MailboxAttrJunk, imap.MailboxAttrSent, imap.MailboxAttrTrash}
 
 	var folders []Folder
 

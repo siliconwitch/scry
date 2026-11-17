@@ -103,6 +103,5 @@ events.onerror = async () => {
     events.close();
     showState("scry has closed");
     document.title = "scry";
-    window.close();
   }
 };

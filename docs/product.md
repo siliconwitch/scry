@@ -7,8 +7,10 @@ browser window beside it.
 ## Philosophy
 
 - **Configured in one text file.** Every setting lives in
-  `~/.config/scry/config.toml`. scry has no settings screen and saves no
-  preferences of its own, so the file can live in a dotfiles repo.
+  `~/.config/scry/config.toml`, or the file that `SCRY_CONFIG` names. scry
+  has no settings screen and saves no preferences of its own, so the file can
+  live in a dotfiles repo. scry refuses to start when the config has a
+  mistake, and says what to fix.
 - **Unified inbox, but everything else stays separate.** Mail from all accounts
   appears in one inbox. Each email stays in the account it arrived in. Its
   archive, folders, spam and trash belong to that account. scry never moves
@@ -72,12 +74,17 @@ Everything you can see and do in scry. Anything not listed here is out.
 
 ### Reading
 
-- Moving to an email shows it in the viewer and marks it read.
+- The selected email shows in the viewer. It is marked read only while the
+  email list has focus.
+- Choosing a folder selects its first email. From the sidebar, that email
+  stays unread until you move to the email list. The number keys focus the
+  email list, so they mark it read.
 - The config can name a browser command that opens the viewer at startup, such
   as `chromium --app=%s`. The sync log view shows the viewer's address for any
   browser.
 - The viewer header shows the sender and the To, Cc and Bcc recipients. Bcc
-  shows only on email you sent. Clicking a name or address copies it.
+  shows when the email carries one, which is normally only email you sent.
+  Clicking a name or address copies it.
 - The viewer lists attachments. Clicking one downloads it.
 - `y` copies the sender's address.
 
@@ -103,12 +110,13 @@ Everything you can see and do in scry. Anything not listed here is out.
 
 - `n` starts a new email. `R` replies to the sender. `r` replies to the sender
   and every recipient.
-- scry opens the email in `$EDITOR`. Header lines set From, To, Cc, Bcc,
-  Subject and Attach, then a blank line starts the body.
+- scry opens the email in `$VISUAL`. Without it, scry uses `$EDITOR`, then
+  `vi`. Header lines set From, To, Cc, Bcc, Subject and Attach, then a blank
+  line starts the body.
 - Bcc recipients get the email, but no recipient sees the Bcc line.
 - A reply quotes the original, adds `Re:` to the subject and threads under the
   original.
-- A reply always goes from the account the original email arrived in.
+- A reply starts from the account the original email arrived in.
 - You write plain text, with `**bold**` and `-` bullet lists.
 - Each account can name an HTML file as its signature.
 - Images and files can be attached, one Attach line each.
@@ -150,8 +158,11 @@ Everything you can see and do in scry. Anything not listed here is out.
 
 - Every action has a keybind and a mouse equivalent. The footer shows the keys
   for the current view as buttons.
-- `j` and `k`, the arrow keys, Page Up, Page Down, Home and End move through a
-  list. Tab, `h` and `l` switch between the sidebar and the email list.
+- `j` and `k`, Up and Down, Page Up, Page Down, Home and End move through a
+  list.
+- Tab switches between the sidebar and the email list. `h` or Left focuses
+  the sidebar. `l`, Right or Enter focuses the email list, which marks the
+  selected email read.
 - Clicking an email selects it and shows it in the viewer. Clicking a folder,
   button or icon runs it.
 - The mouse wheel scrolls lists.
@@ -171,7 +182,8 @@ Everything scry does that you don't see or drive directly.
 - Each account's mirror is encrypted with a key derived from that account's
   password.
 - When an account's password changes, scry deletes that account's mirror and
-  downloads it again. The server always holds the real copy.
+  downloads it again from the server. The account's Outbox and any changes
+  waiting for a sync are lost, because only the mirror holds them.
 - Reading, archive, move, spam and delete work offline. scry applies them to
   the local mirror at once and starts a sync to send them to the server.
   Without a connection, they wait and go out once the connection returns.
@@ -187,6 +199,9 @@ Everything scry does that you don't see or drive directly.
 - scry downloads every remote image in a new email during sync, whether or not
   you read it. A tracking image then shows the sender only that the email was
   delivered, not whether or when you read it.
+- A remote image means an `<img>` source or a `background` attribute with an
+  `http://` or `https://` address. Images set any other way, such as in CSS,
+  stay blank.
 - scry fetches nothing for Spam, so spammers can't confirm your address is
   live. Images in Spam stay blank.
 - scry never fetches an image from a private or local network address.
@@ -213,7 +228,9 @@ Everything scry does that you don't see or drive directly.
 - scry syncs when it opens, after you read, archive, move, spam, delete or send
   an email, and every 10 minutes.
 - scry keeps a connection open to each account's Inbox. The server reports new
-  mail on it, and scry syncs at once.
+  mail and changes from other clients on it, and scry syncs at once.
+- When that connection drops, scry reconnects and syncs after 10 seconds,
+  doubling the wait up to 5 minutes.
 - An action during a sync queues another sync, which starts when the current
   one ends. One queued sync covers every action taken while it waits.
 

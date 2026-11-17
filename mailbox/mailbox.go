@@ -54,14 +54,6 @@ type Address struct {
 	Email string
 }
 
-func (a Address) String() string {
-	if a.Name == "" {
-		return a.Email
-	}
-
-	return a.Name + " <" + a.Email + ">"
-}
-
 func (a Address) Short() string {
 	if a.Name == "" {
 		return a.Email
@@ -481,11 +473,6 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 
 		for _, message := range index.Messages {
 			message.Account = account.Name
-
-			if message.ServerFolder == "" {
-				message.ServerFolder = message.Folder
-			}
-
 			b.messages = append(b.messages, message)
 		}
 
@@ -736,8 +723,7 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 				}
 			}
 
-			// RFC 5321 asks clients to wait 10 minutes for the reply to the end of the data, because servers may scan the email first.
-			connection.SetDeadline(time.Now().Add(10 * time.Minute))
+			connection.SetDeadline(time.Now().Add(time.Minute))
 
 			err = data.Close()
 

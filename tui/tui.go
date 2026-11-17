@@ -67,6 +67,11 @@ type retryMsg struct {
 
 type heartbeatMsg struct{ scheduled time.Time }
 
+type watchRetryMsg struct {
+	account    string
+	generation int
+}
+
 type watchDoneMsg struct {
 	account    string
 	generation int
@@ -118,6 +123,7 @@ type accountSync struct {
 	retryGeneration int
 	watching        bool
 	watchGeneration int
+	watchRetryDelay time.Duration
 	stopWatch       context.CancelFunc
 }
 
@@ -164,6 +170,7 @@ type Model struct {
 	messages     []mailbox.Message
 	messageIndex int
 	listOffset   int
+	folderOffset int
 	focus        pane
 
 	search        textinput.Model
@@ -223,7 +230,7 @@ func New(options Options) *Model {
 }
 
 func (m *Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{tea.RequestBackgroundColor, m.showSelected(), heartbeat()}
+	cmds := []tea.Cmd{tea.RequestBackgroundColor, m.showSelected(false), heartbeat()}
 
 	for _, account := range m.accounts {
 		cmds = append(cmds, m.requestSync(account.Name))
@@ -259,10 +266,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.search.SetValue("")
 			m.search.Blur()
 			m.searchFocused = false
-			m.messageIndex = 0
+			m.messageIndex = -1
 			m.listOffset = 0
 			m.reload()
-			return m, m.showSelected()
+			return m, m.showSelected(false)
 
 		case "enter", "tab":
 			m.search.Blur()
@@ -270,11 +277,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.focus = listPane
 			return m, nil
 
-		case "up", "ctrl+p":
+		case "up":
 			m.focus = listPane
 			return m.handleKey("k")
 
-		case "down", "ctrl+n":
+		case "down":
 			m.focus = listPane
 			return m.handleKey("j")
 		}
@@ -285,18 +292,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.search, cmd = m.search.Update(msg)
 
 		if m.search.Value() != previous {
-			m.messageIndex = 0
+			m.messageIndex = -1
 			m.listOffset = 0
 			m.reload()
-			cmd = tea.Batch(cmd, m.showSelected())
+			cmd = tea.Batch(cmd, m.showSelected(false))
 		}
 
 		return m, cmd
 
 	case tea.MouseWheelMsg:
-		key := "j"
+		key, step := "j", 1
 		if msg.Mouse().Button == tea.MouseWheelUp {
-			key = "k"
+			key, step = "k", -1
 		}
 
 		switch {
@@ -304,16 +311,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleKey(key)
 
 		case m.zones.Get("pane:folders").InBounds(msg):
-			m.focus = folderPane
+			folderLines := len(m.folderRows) + 2*len(m.accounts)
+			m.folderOffset = max(0, min(m.folderOffset+step, folderLines-(m.panesHeight()-2)))
 
 		case m.zones.Get("pane:list").InBounds(msg):
-			m.focus = listPane
-
-		default:
-			return m, nil
+			m.listOffset = max(0, min(m.listOffset+step, len(m.messages)-m.listRows()))
 		}
 
-		return m.handleKey(key)
+		return m, nil
 
 	case tea.MouseClickMsg:
 		if msg.Mouse().Button != tea.MouseLeft {
@@ -362,7 +367,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.zones.Get(fmt.Sprintf("message:%d", i)).InBounds(msg) {
 				m.focus = listPane
 				m.messageIndex = i
-				return m, m.showSelected()
+				return m, m.showSelected(true)
 			}
 		}
 
@@ -375,7 +380,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.reload()
 
-		return m, tea.Batch(m.showSelected(), tea.Tick(2*time.Second, func(time.Time) tea.Msg { return syncProgressMsg{} }))
+		return m, tea.Batch(m.showSelected(false), tea.Tick(2*time.Second, func(time.Time) tea.Msg { return syncProgressMsg{} }))
 
 	case syncDoneMsg:
 		state := m.syncs[msg.account]
@@ -393,7 +398,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.reload()
 
-		cmds := []tea.Cmd{m.showSelected()}
+		cmds := []tea.Cmd{m.showSelected(false)}
 
 		unlocked := m.options.Mail.Unlocked(msg.account)
 
@@ -440,7 +445,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		state.watching = false
 
 		if msg.err != nil {
-			m.options.Log.Write(msg.account, "Inbox watch stopped: %s. It restarts after the next sync", msg.err)
+			state.watchRetryDelay = min(5*time.Minute, max(10*time.Second, 2*state.watchRetryDelay))
+
+			account := msg.account
+			generation := state.watchGeneration
+
+			m.options.Log.Write(account, "Inbox watch stopped: %s. Reconnecting in %s", msg.err, state.watchRetryDelay)
+
+			return m, tea.Tick(state.watchRetryDelay, func(time.Time) tea.Msg { return watchRetryMsg{account: account, generation: generation} })
+		}
+
+		state.watchRetryDelay = 0
+
+		return m, tea.Batch(m.startWatch(msg.account), m.requestSync(msg.account))
+
+	case watchRetryMsg:
+		if msg.generation != m.syncs[msg.account].watchGeneration {
 			return m, nil
 		}
 
@@ -610,7 +630,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.missingAttachments = nil
 		m.reload()
 
-		return m, nil
+		return m, m.showSelected(false)
 
 	case noticeExpiredMsg:
 		if msg.generation == m.noticeGeneration {
@@ -665,11 +685,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			default:
 				m.draftError = fmt.Sprintf("Unknown header line %q. Use From, To, Cc, Bcc, Subject or Attach.", line)
 			}
-		}
-
-		if edited.ReplyTo != "" && edited.Account != m.draft.Account {
-			m.draftError = "Replies always go from " + m.draft.Account + "."
-			edited.Account = m.draft.Account
 		}
 
 		_, ok := m.options.Mail.Account(edited.Account)
@@ -793,7 +808,7 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 	}
 
 	if m.sending {
-		if key == "u" || key == "esc" {
+		if key == "u" {
 			m.sending = false
 			m.sendGen++
 			m.draftVisible = true
@@ -884,7 +899,7 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 
 			return m, m.sendTick()
 
-		case "h", "esc":
+		case "h":
 			m.draftVisible = false
 
 		case "x":
@@ -899,17 +914,20 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 	selected, hasSelection := m.selected()
 
 	switch key {
-	case "tab", "h", "l", "left", "right":
-		if m.focus == folderPane {
-			m.focus = listPane
-		} else {
+	case "h", "left":
+		m.focus = folderPane
+
+	case "tab", "enter", "l", "right":
+		if key == "tab" && m.focus == listPane {
 			m.focus = folderPane
+			return m, nil
 		}
 
-	case "enter":
-		if m.focus == folderPane {
-			m.focus = listPane
-		}
+		m.focus = listPane
+		m.messageIndex = min(max(0, m.messageIndex), len(m.messages)-1)
+		m.clampList()
+
+		return m, m.showSelected(true)
 
 	case "j", "down", "k", "up", "pgdown", "pgup", "home", "end":
 		step := map[string]int{"j": 1, "down": 1, "k": -1, "up": -1, "pgdown": m.listRows(), "pgup": -m.listRows(), "home": -1 << 30, "end": 1 << 30}[key]
@@ -918,16 +936,17 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 			return m, m.selectFolder(m.folderIndex + step)
 		}
 
-		m.messageIndex = max(0, min(m.messageIndex+step, len(m.messages)-1))
+		previous := m.messageIndex
+		m.messageIndex = min(max(0, m.messageIndex+step), len(m.messages)-1)
 		m.clampList()
-		return m, m.showSelected()
+		return m, m.showSelected(m.messageIndex != previous)
 
 	case "esc":
 		if m.search.Value() != "" {
 			m.search.SetValue("")
-			m.messageIndex = 0
+			m.messageIndex = -1
 			m.reload()
-			return m, m.showSelected()
+			return m, m.showSelected(false)
 		}
 
 	case "A":
@@ -999,15 +1018,30 @@ func (m *Model) selectFolder(index int) tea.Cmd {
 		m.search.SetValue("")
 	}
 
-	m.messageIndex = 0
+	m.messageIndex = -1
 	m.listOffset = 0
 	m.reload()
+	m.messageIndex = min(0, len(m.messages)-1)
 
-	return m.showSelected()
+	selectedLine := m.folderIndex
+	previousAccount := ""
+
+	for _, row := range m.folderRows[:m.folderIndex+1] {
+		if row.account != previousAccount {
+			selectedLine += 2
+			previousAccount = row.account
+		}
+	}
+
+	folderRows := m.panesHeight() - 2
+	m.folderOffset = max(0, min(selectedLine-folderRows/2, len(m.folderRows)+2*len(m.accounts)-folderRows))
+
+	return m.showSelected(m.focus == listPane)
 }
 
 func (m *Model) reload() {
-	previous, _ := m.selected()
+	previous, hadSelection := m.selected()
+	selectionVisible := hadSelection && m.messageIndex >= m.listOffset && m.messageIndex < m.listOffset+m.listRows()
 
 	selectedRow := folderRow{folder: mailbox.Inbox}
 
@@ -1042,14 +1076,15 @@ func (m *Model) reload() {
 		m.messages = m.options.Mail.Folder(row.account, row.folder)
 	}
 
-	index := slices.IndexFunc(m.messages, func(message mailbox.Message) bool { return message.ID == previous.ID })
+	m.messageIndex = slices.IndexFunc(m.messages, func(message mailbox.Message) bool { return message.ID == previous.ID })
 
-	if index >= 0 {
-		m.messageIndex = index
+	switch {
+	case selectionVisible && m.messageIndex >= 0:
+		m.clampList()
+
+	default:
+		m.listOffset = max(0, min(m.listOffset, len(m.messages)-m.listRows()))
 	}
-
-	m.messageIndex = max(0, min(m.messageIndex, len(m.messages)-1))
-	m.clampList()
 
 	m.unreadCounts = make([]int, len(m.folderRows))
 
@@ -1066,7 +1101,7 @@ func (m *Model) selected() (mailbox.Message, bool) {
 	return m.messages[m.messageIndex], true
 }
 
-func (m *Model) showSelected() tea.Cmd {
+func (m *Model) showSelected(markRead bool) tea.Cmd {
 	message, ok := m.selected()
 
 	if !ok {
@@ -1078,27 +1113,27 @@ func (m *Model) showSelected() tea.Cmd {
 		return nil
 	}
 
-	if message.ID == m.shownID {
-		return nil
-	}
-
-	m.shownID = message.ID
-
 	mail := m.options.Mail
 
-	load := func() tea.Msg {
-		loaded, err := mail.Load(message.ID)
-		return bodyLoadedMsg{id: message.ID, message: loaded, err: err}
+	var cmds []tea.Cmd
+
+	if message.ID != m.shownID {
+		m.shownID = message.ID
+
+		cmds = append(cmds, func() tea.Msg {
+			loaded, err := mail.Load(message.ID)
+			return bodyLoadedMsg{id: message.ID, message: loaded, err: err}
+		})
 	}
 
-	if !message.Unread {
-		return load
+	if markRead && message.Unread {
+		mail.MarkRead(message.ID)
+		m.reload()
+
+		cmds = append(cmds, func() tea.Msg { return savedMsg{err: mail.Save()} }, m.requestSync(message.Account))
 	}
 
-	mail.MarkRead(message.ID)
-	m.reload()
-
-	return tea.Batch(load, func() tea.Msg { return savedMsg{err: mail.Save()} }, m.requestSync(message.Account))
+	return tea.Batch(cmds...)
 }
 
 func (m *Model) moveSelected(folder string) tea.Cmd {
@@ -1120,11 +1155,14 @@ func (m *Model) moveSelected(folder string) tea.Cmd {
 
 	m.options.Log.Write(message.Account, "Moved an email to %s", folder)
 
+	index := m.messageIndex
 	m.reload()
+	m.messageIndex = min(index, len(m.messages)-1)
+	m.clampList()
 
 	mail := m.options.Mail
 
-	return tea.Batch(m.showSelected(), m.setNotice("Moved to "+folder), func() tea.Msg { return savedMsg{err: mail.Save()} }, m.requestSync(message.Account))
+	return tea.Batch(m.showSelected(true), m.setNotice("Moved to "+folder), func() tea.Msg { return savedMsg{err: mail.Save()} }, m.requestSync(message.Account))
 }
 
 func (m *Model) unqueue(id string) tea.Cmd {
@@ -1291,7 +1329,7 @@ func (m *Model) requestSync(account string) tea.Cmd {
 		progressTick = tea.Tick(2*time.Second, func(time.Time) tea.Msg { return syncProgressMsg{} })
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
 
 	state.running = true
 	state.cancel = cancel
@@ -1488,7 +1526,6 @@ func (m *Model) View() tea.View {
 	folderInnerWidth := folderPaneWidth - 2
 
 	var folderLines []string
-	selectedLine := 0
 	previousAccount := "-"
 
 	for i, row := range m.folderRows {
@@ -1520,7 +1557,6 @@ func (m *Model) View() tea.View {
 		style := lipgloss.NewStyle()
 
 		if i == m.folderIndex && m.search.Value() == "" {
-			selectedLine = len(folderLines)
 			markerColor := mutedColor
 			if m.focus == folderPane && !m.draftVisible {
 				markerColor = m.accountColor(row.account)
@@ -1535,7 +1571,7 @@ func (m *Model) View() tea.View {
 		folderLines = append(folderLines, m.zones.Mark(fmt.Sprintf("folder:%d", i), fit(line, folderInnerWidth)))
 	}
 
-	folderOffset := max(0, min(selectedLine-innerHeight/2, len(folderLines)-innerHeight))
+	folderOffset := max(0, min(m.folderOffset, len(folderLines)-innerHeight))
 	visibleFolders := folderLines[folderOffset:min(len(folderLines), folderOffset+innerHeight)]
 
 	folderBorder := mutedColor

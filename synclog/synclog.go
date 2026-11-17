@@ -69,13 +69,11 @@ func Open(directory string, keepDays int) (*Log, error) {
 		for _, line := range strings.Split(strings.TrimRight(string(content), "\n"), "\n") {
 			fields := strings.SplitN(line, "\t", 3)
 
-			if len(fields) == 3 {
-				loaded = append(loaded, Entry{Time: fields[0], Account: fields[1], Text: fields[2]})
+			if len(fields) != 3 {
 				continue
 			}
 
-			stamp, text, _ := strings.Cut(line, "  ")
-			loaded = append(loaded, Entry{Time: stamp, Text: text})
+			loaded = append(loaded, Entry{Time: fields[0], Account: fields[1], Text: fields[2]})
 		}
 	}
 
