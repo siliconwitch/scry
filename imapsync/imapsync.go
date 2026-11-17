@@ -10,6 +10,7 @@ import (
 	"mime"
 	"net"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -585,8 +586,10 @@ func (s *Session) Fetch(uids []uint32, deliver func([]Fetched) error) error {
 
 func PlainText(document string) string {
 	tokenizer := html.NewTokenizer(strings.NewReader(document))
-	var text strings.Builder
+	whitespace := regexp.MustCompile(`[ \t\n\f\r]+`)
+	var text bytes.Buffer
 	skipping := ""
+	preformatted := 0
 
 	for {
 		tokenType := tokenizer.Next()
@@ -596,6 +599,7 @@ func PlainText(document string) string {
 		}
 
 		token := tokenizer.Token()
+		isStart := tokenType == html.StartTagToken || tokenType == html.SelfClosingTagToken
 
 		switch {
 		case tokenType == html.StartTagToken && (token.Data == "script" || token.Data == "style" || token.Data == "head"):
@@ -604,11 +608,28 @@ func PlainText(document string) string {
 		case tokenType == html.EndTagToken && token.Data == skipping:
 			skipping = ""
 
-		case tokenType == html.TextToken && skipping == "":
+		case tokenType == html.TextToken && skipping == "" && preformatted > 0:
 			text.WriteString(token.Data)
 
-		case tokenType == html.StartTagToken && (token.Data == "br" || token.Data == "p" || token.Data == "div" || token.Data == "tr" || token.Data == "li"):
+		case tokenType == html.TextToken && skipping == "":
+			collapsed := whitespace.ReplaceAllString(token.Data, " ")
+
+			if text.Len() == 0 || bytes.HasSuffix(text.Bytes(), []byte("\n")) || bytes.HasSuffix(text.Bytes(), []byte(" ")) {
+				collapsed = strings.TrimPrefix(collapsed, " ")
+			}
+
+			text.WriteString(collapsed)
+
+		case tokenType == html.EndTagToken && token.Data == "pre":
+			preformatted = max(preformatted-1, 0)
+
+		case isStart && (token.Data == "br" || token.Data == "p" || token.Data == "div" || token.Data == "tr" || token.Data == "li" || token.Data == "pre"):
+			text.Truncate(len(bytes.TrimRight(text.Bytes(), " ")))
 			text.WriteString("\n")
+
+			if token.Data == "pre" {
+				preformatted++
+			}
 		}
 	}
 
