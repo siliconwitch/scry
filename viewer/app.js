@@ -63,6 +63,10 @@ const refresh = async () => {
   document.body.style.setProperty("--account-dark", page.accountDark);
   showAddresses(element("from"), [page.from]);
   showAddresses(element("to"), page.to);
+  showAddresses(element("cc"), page.cc || []);
+  showAddresses(element("bcc"), page.bcc || []);
+  element("cc-row").hidden = !page.cc?.length;
+  element("bcc-row").hidden = !page.bcc?.length;
   element("date").textContent = page.date;
 
   const attachments = element("attachments");

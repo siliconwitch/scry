@@ -76,8 +76,8 @@ Everything you can see and do in scry. Anything not listed here is out.
 - The config can name a browser command that opens the viewer at startup, such
   as `chromium --app=%s`. The sync log view shows the viewer's address for any
   browser.
-- The viewer header shows the sender and recipients. Clicking a name or
-  address copies it.
+- The viewer header shows the sender and the To, Cc and Bcc recipients. Bcc
+  shows only on email you sent. Clicking a name or address copies it.
 - The viewer lists attachments. Clicking one downloads it.
 - `y` copies the sender's address.
 

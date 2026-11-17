@@ -44,6 +44,8 @@ type Fetched struct {
 	Seen        bool
 	From        Address
 	To          []Address
+	Cc          []Address
+	Bcc         []Address
 	Subject     string
 	Date        time.Time
 	MessageID   string
@@ -315,6 +317,29 @@ func (s *Session) Move(uids []uint32, destination string) (map[uint32]uint32, er
 	return moved, nil
 }
 
+func (s *Session) AppendSeen(folder string, content []byte) error {
+	s.conn.watch(true)
+	defer s.conn.watch(false)
+
+	command := s.client.Append(folder, int64(len(content)), &imap.AppendOptions{Flags: []imap.Flag{imap.FlagSeen}})
+
+	_, err := command.Write(content)
+
+	if err != nil {
+		return err
+	}
+
+	err = command.Close()
+
+	if err != nil {
+		return err
+	}
+
+	_, err = command.Wait()
+
+	return err
+}
+
 func (s *Session) HasMessageID(messageID string) (bool, error) {
 	s.conn.watch(true)
 	defer s.conn.watch(false)
@@ -442,10 +467,15 @@ func (s *Session) Fetch(uids []uint32, deliver func([]Fetched) error) error {
 				fetched.From = Address{Name: from[0].Name, Email: from[0].Address}
 			}
 
-			to, _ := reader.Header.AddressList("To")
+			for _, recipients := range []struct {
+				key  string
+				list *[]Address
+			}{{"To", &fetched.To}, {"Cc", &fetched.Cc}, {"Bcc", &fetched.Bcc}} {
+				addresses, _ := reader.Header.AddressList(recipients.key)
 
-			for _, address := range to {
-				fetched.To = append(fetched.To, Address{Name: address.Name, Email: address.Address})
+				for _, address := range addresses {
+					*recipients.list = append(*recipients.list, Address{Name: address.Name, Email: address.Address})
+				}
 			}
 
 			inlineImages := map[string]string{}

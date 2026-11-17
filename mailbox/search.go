@@ -71,7 +71,7 @@ func Search(messages []Message, query string) []Message {
 			personScore := matchScore(message.From.Name, term.value)
 			personScore = max(personScore, matchScore(message.From.Email, term.value))
 
-			for _, recipient := range message.To {
+			for _, recipient := range slices.Concat(message.To, message.Cc, message.Bcc) {
 				personScore = max(personScore, matchScore(recipient.Name, term.value))
 				personScore = max(personScore, matchScore(recipient.Email, term.value))
 			}

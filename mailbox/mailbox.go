@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/emersion/go-message/mail"
+	mimeheader "github.com/emersion/go-message/textproto"
 	"golang.org/x/net/html"
 	"golang.org/x/sync/errgroup"
 
@@ -82,6 +83,8 @@ type Message struct {
 	ServerFolder string
 	From         Address
 	To           []Address
+	Cc           []Address
+	Bcc          []Address
 	Subject      string
 	Date         time.Time
 	MessageID    string
@@ -107,6 +110,8 @@ type Account struct {
 type Draft struct {
 	Account string
 	To      string
+	Cc      string
+	Bcc     string
 	Subject string
 	Attach  []string
 	Body    string
@@ -153,6 +158,7 @@ type storedBody struct {
 	HTML        string
 	Attachments []Attachment
 	Raw         []byte
+	BccHeader   []byte
 	Recipients  []string
 	Draft       Draft
 }
@@ -758,6 +764,33 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 
 		report("Outbox: sent")
 		removeQueued(queued.ID)
+
+		if servers[Sent] == "" {
+			continue
+		}
+
+		filed, err := session.HasMessageID(queued.MessageID)
+
+		if err != nil {
+			report("Outbox: checking Sent for the server's own copy failed, so no copy is saved: %v", err)
+			failures = append(failures, fmt.Errorf("checking Sent: %w", err))
+			continue
+		}
+
+		if filed {
+			report("Outbox: the server saved its own copy in Sent")
+			continue
+		}
+
+		err = session.AppendSeen(servers[Sent], append(stored.BccHeader, stored.Raw...))
+
+		if err != nil {
+			report("Outbox: saving a copy to Sent failed: %v", err)
+			failures = append(failures, fmt.Errorf("saving a copy to Sent: %w", err))
+			continue
+		}
+
+		report("Outbox: saved a copy to Sent")
 	}
 
 	pendingMoves := map[string][]Message{}
@@ -1365,6 +1398,14 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 						message.To = append(message.To, Address{Name: recipient.Name, Email: recipient.Email})
 					}
 
+					for _, recipient := range fetched.Cc {
+						message.Cc = append(message.Cc, Address{Name: recipient.Name, Email: recipient.Email})
+					}
+
+					for _, recipient := range fetched.Bcc {
+						message.Bcc = append(message.Bcc, Address{Name: recipient.Name, Email: recipient.Email})
+					}
+
 					stored := storedBody{HTML: body}
 
 					for _, attachment := range fetched.Attachments {
@@ -1609,6 +1650,24 @@ func (b *Mailbox) Queue(draft Draft) error {
 		return fmt.Errorf("reading the To line: %w", err)
 	}
 
+	var cc, bcc []*mail.Address
+
+	if strings.TrimSpace(draft.Cc) != "" {
+		cc, err = mail.ParseAddressList(draft.Cc)
+
+		if err != nil {
+			return fmt.Errorf("reading the Cc line: %w", err)
+		}
+	}
+
+	if strings.TrimSpace(draft.Bcc) != "" {
+		bcc, err = mail.ParseAddressList(draft.Bcc)
+
+		if err != nil {
+			return fmt.Errorf("reading the Bcc line: %w", err)
+		}
+	}
+
 	_, domain, _ := strings.Cut(account.Email, "@")
 
 	now := time.Now()
@@ -1618,6 +1677,7 @@ func (b *Mailbox) Queue(draft Draft) error {
 	header.SetDate(now)
 	header.SetAddressList("From", []*mail.Address{{Address: account.Email}})
 	header.SetAddressList("To", recipients)
+	header.SetAddressList("Cc", cc)
 	header.SetSubject(draft.Subject)
 
 	err = header.GenerateMessageIDWithHostname(domain)
@@ -1828,10 +1888,33 @@ func (b *Mailbox) Queue(draft Draft) error {
 		Text:         plainText,
 	}
 
-	stored := storedBody{HTML: htmlText, Attachments: attachments, Raw: encoded.Bytes(), Draft: draft}
+	// Only the copy in Sent carries the Bcc line, so the recipients never see it.
+	var bccFields mail.Header
+
+	bccFields.SetAddressList("Bcc", bcc)
+
+	var bccHeader bytes.Buffer
+
+	err = mimeheader.WriteHeader(&bccHeader, bccFields.Header.Header)
+
+	if err != nil {
+		return err
+	}
+
+	stored := storedBody{HTML: htmlText, Attachments: attachments, Raw: encoded.Bytes(), BccHeader: bytes.TrimSuffix(bccHeader.Bytes(), []byte("\r\n")), Draft: draft}
 
 	for _, recipient := range recipients {
 		message.To = append(message.To, Address{Name: recipient.Name, Email: recipient.Address})
+		stored.Recipients = append(stored.Recipients, recipient.Address)
+	}
+
+	for _, recipient := range cc {
+		message.Cc = append(message.Cc, Address{Name: recipient.Name, Email: recipient.Address})
+		stored.Recipients = append(stored.Recipients, recipient.Address)
+	}
+
+	for _, recipient := range bcc {
+		message.Bcc = append(message.Bcc, Address{Name: recipient.Name, Email: recipient.Address})
 		stored.Recipients = append(stored.Recipients, recipient.Address)
 	}
 

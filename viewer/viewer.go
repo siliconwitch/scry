@@ -35,6 +35,8 @@ type Page struct {
 	Subject      string
 	From         Address
 	To           []Address
+	Cc           []Address
+	Bcc          []Address
 	Date         string
 	HTML         string
 	Text         string
@@ -198,6 +200,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"subject":      page.Subject,
 			"from":         page.From,
 			"to":           page.To,
+			"cc":           page.Cc,
+			"bcc":          page.Bcc,
 			"date":         page.Date,
 			"attachments":  attachments,
 			"body":         fmt.Sprintf("body/%d", version),

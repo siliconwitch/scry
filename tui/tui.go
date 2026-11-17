@@ -521,6 +521,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			recipients = append(recipients, viewer.Address{Name: recipient.Name, Email: recipient.Email})
 		}
 
+		var copied, blindCopied []viewer.Address
+		for _, recipient := range msg.message.Cc {
+			copied = append(copied, viewer.Address{Name: recipient.Name, Email: recipient.Email})
+		}
+
+		for _, recipient := range msg.message.Bcc {
+			blindCopied = append(blindCopied, viewer.Address{Name: recipient.Name, Email: recipient.Email})
+		}
+
 		var attachments []viewer.Attachment
 		for _, attachment := range msg.message.Attachments {
 			attachments = append(attachments, viewer.Attachment{Name: attachment.Name, Data: attachment.Data})
@@ -531,6 +540,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Subject:      msg.message.Subject,
 			From:         viewer.Address{Name: msg.message.From.Name, Email: msg.message.From.Email},
 			To:           recipients,
+			Cc:           copied,
+			Bcc:          blindCopied,
 			Date:         msg.message.Date.Local().Format("Mon 2 Jan 2006, 15:04"),
 			HTML:         msg.message.HTML,
 			Text:         msg.message.Text,
@@ -637,6 +648,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "to":
 				edited.To = value
 
+			case "cc":
+				edited.Cc = value
+
+			case "bcc":
+				edited.Bcc = value
+
 			case "subject":
 				edited.Subject = value
 
@@ -646,7 +663,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 			default:
-				m.draftError = fmt.Sprintf("Unknown header line %q. Use From, To, Subject or Attach.", line)
+				m.draftError = fmt.Sprintf("Unknown header line %q. Use From, To, Cc, Bcc, Subject or Attach.", line)
 			}
 		}
 
@@ -1157,23 +1174,33 @@ func (m *Model) startCompose(replyID string, replyAll bool) tea.Cmd {
 		}
 
 		recipients := []string{original.From.Email}
+		var copied []string
 
 		if replyAll {
 			account, _ := m.options.Mail.Account(original.Account)
+			added := []string{account.Email}
 
 			recipients = nil
-			for _, address := range append([]mailbox.Address{original.From}, original.To...) {
-				if strings.EqualFold(address.Email, account.Email) || slices.ContainsFunc(recipients, func(email string) bool { return strings.EqualFold(email, address.Email) }) {
-					continue
-				}
 
-				recipients = append(recipients, address.Email)
+			for _, group := range []struct {
+				addresses []mailbox.Address
+				line      *[]string
+			}{{append([]mailbox.Address{original.From}, original.To...), &recipients}, {original.Cc, &copied}} {
+				for _, address := range group.addresses {
+					if slices.ContainsFunc(added, func(email string) bool { return strings.EqualFold(email, address.Email) }) {
+						continue
+					}
+
+					added = append(added, address.Email)
+					*group.line = append(*group.line, address.Email)
+				}
 			}
 		}
 
 		draft = mailbox.Draft{
 			Account: original.Account,
 			To:      strings.Join(recipients, ", "),
+			Cc:      strings.Join(copied, ", "),
 			Subject: subject,
 			Body:    "\n\nOn " + original.Date.Format("Mon 2 Jan 2006 at 15:04") + ", " + original.From.Short() + " wrote:\n" + quoted.String(),
 			ReplyTo: original.ID,
@@ -1203,6 +1230,8 @@ func (m *Model) openEditor() tea.Cmd {
 
 	content.WriteString("From: " + m.draft.Account + "\n")
 	content.WriteString("To: " + m.draft.To + "\n")
+	content.WriteString("Cc: " + m.draft.Cc + "\n")
+	content.WriteString("Bcc: " + m.draft.Bcc + "\n")
 	content.WriteString("Subject: " + m.draft.Subject + "\n")
 
 	for _, path := range m.draft.Attach {
@@ -1529,8 +1558,15 @@ func (m *Model) View() tea.View {
 			" " + boldStyle.Render("Draft") + m.style(mutedColor).Render("  from ") + m.style(m.accountColor(draft.Account)).Bold(true).Render(draft.Account),
 			"",
 			" " + labelStyle.Render("To") + fit(draft.To, rightInnerWidth-12),
-			" " + labelStyle.Render("Subject") + fit(draft.Subject, rightInnerWidth-12),
 		}
+
+		for _, field := range []struct{ label, value string }{{"Cc", draft.Cc}, {"Bcc", draft.Bcc}} {
+			if field.value != "" {
+				lines = append(lines, " "+labelStyle.Render(field.label)+fit(field.value, rightInnerWidth-12))
+			}
+		}
+
+		lines = append(lines, " "+labelStyle.Render("Subject")+fit(draft.Subject, rightInnerWidth-12))
 
 		for i, path := range draft.Attach {
 			label := ""

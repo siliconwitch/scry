@@ -2,6 +2,7 @@ package mailbox
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -33,15 +34,16 @@ func TestSend(t *testing.T) {
 	deliveries := make(chan delivery, 8)
 
 	var smtpPassword atomic.Value
+	var serverFilesSent atomic.Bool
 
-	memory := imapmemserver.New()
 	user := imapmemserver.NewUser("me@example.com", "secret")
-	memory.AddUser(user)
-	user.Create("INBOX", nil)
+	for _, name := range []string{"INBOX", "Sent", "Archive", "Junk", "Deleted"} {
+		user.Create(name, nil)
+	}
 
 	imapServer := imapserver.New(&imapserver.Options{
 		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
-			return memory.NewSession(), nil, nil
+			return sentFolderSession{imapmemserver.NewUserSession(user)}, nil, nil
 		},
 		Caps:      imap.CapSet{imap.CapIMAP4rev1: {}, imap.CapUIDPlus: {}, imap.CapMove: {}},
 		TLSConfig: serverTLS,
@@ -132,6 +134,10 @@ func TestSend(t *testing.T) {
 							return
 						}
 
+						if serverFilesSent.Load() {
+							user.Append("Sent", bytes.NewReader(received.data), &imap.AppendOptions{})
+						}
+
 						deliveries <- received
 						fmt.Fprint(current, "250 ok\r\n")
 
@@ -162,13 +168,14 @@ func TestSend(t *testing.T) {
 		draft        Draft
 		wantQueueErr string
 		unqueue      bool
+		serverFiles  bool
 		wantErr      string
 		want         []string
 	}{
 		{
 			name:     "returned to the draft before sending",
 			password: "secret",
-			draft:    Draft{Account: "Personal", To: "alex@example.com", Subject: "Re: Saturday walk?", Body: "Yes.", Attach: []string{attachmentPath}, ReplyTo: "original"},
+			draft:    Draft{Account: "Personal", To: "alex@example.com", Cc: "robin@example.org", Bcc: "kim@example.net", Subject: "Re: Saturday walk?", Body: "Yes.", Attach: []string{attachmentPath}, ReplyTo: "original"},
 			unqueue:  true,
 		},
 		{
@@ -177,13 +184,18 @@ func TestSend(t *testing.T) {
 			draft: Draft{
 				Account: "Personal",
 				To:      "Alex Moreno <alex@example.com>, sam@example.net",
+				Cc:      "Robin Hale <robin@example.org>",
+				Bcc:     "kim@example.net",
 				Subject: "Saturday walk",
 				Body:    "Hi **Alex**,\nsee <you> at 10** sharp.\n\n- boots\n- **map**\n\nKit",
 				Attach:  []string{attachmentPath},
 			},
 			want: []string{
 				"from FROM:<me@example.com>\n",
-				"recipients TO:<alex@example.com> TO:<sam@example.net>\n",
+				"recipients TO:<alex@example.com> TO:<sam@example.net> TO:<robin@example.org> TO:<kim@example.net>\n",
+				"cc \"Robin Hale\" <robin@example.org>\n",
+				"bcc \n",
+				"copies in Sent 1, with bcc kim@example.net\n",
 				"message-id host example.com\n",
 				"in-reply-to \n",
 				"text/plain: Hi **Alex**,\nsee <you> at 10** sharp.\n\n- boots\n- **map**\n\nKit\n\nKit Hale\nHollow Lane Club\n",
@@ -198,7 +210,21 @@ func TestSend(t *testing.T) {
 			want: []string{
 				"in-reply-to <walk@example.com>\n",
 				"references <plan@example.com> <walk@example.com>\n",
+				"copies in Sent 1, with bcc \n",
 			},
+		},
+		{
+			name:        "server files its own copy in Sent",
+			password:    "secret",
+			serverFiles: true,
+			draft:       Draft{Account: "Personal", To: "alex@example.com", Subject: "Filed", Body: "Hi."},
+			want:        []string{"copies in Sent 1, with bcc \n"},
+		},
+		{
+			name:         "unreadable Cc line",
+			password:     "secret",
+			draft:        Draft{Account: "Personal", To: "alex@example.com", Cc: "not an address", Subject: "Hello", Body: "Hi."},
+			wantQueueErr: "reading the Cc line",
 		},
 		{
 			name:     "smtp refuses the password",
@@ -229,6 +255,7 @@ func TestSend(t *testing.T) {
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			smtpPassword.Store(test.password)
+			serverFilesSent.Store(test.serverFiles)
 
 			box := New([]Account{account}, t.TempDir(), 365)
 			box.Sync(context.Background(), account.Name, t.Logf)
@@ -284,17 +311,11 @@ func TestSend(t *testing.T) {
 
 			err = box.Sync(context.Background(), account.Name, t.Logf)
 
-			if err == nil || !strings.Contains(err.Error(), "the server has no Sent folder") {
-				t.Fatalf("got sync error %v, want the missing Sent folder", err)
-			}
-
-			sendFailed := strings.Contains(err.Error(), "sending:")
-
 			switch {
-			case test.wantErr == "" && sendFailed:
+			case test.wantErr == "" && err != nil:
 				t.Fatalf("unexpected error: %v", err)
 
-			case test.wantErr != "" && !strings.Contains(err.Error(), test.wantErr):
+			case test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)):
 				t.Fatalf("got error %v, want one containing %q", err, test.wantErr)
 
 			case test.wantErr != "":
@@ -345,6 +366,26 @@ func TestSend(t *testing.T) {
 			fmt.Fprintf(&summary, "message-id host %s\n", messageHost)
 			fmt.Fprintf(&summary, "in-reply-to %s\n", reader.Header.Get("In-Reply-To"))
 			fmt.Fprintf(&summary, "references %s\n", reader.Header.Get("References"))
+			fmt.Fprintf(&summary, "cc %s\n", reader.Header.Get("Cc"))
+			fmt.Fprintf(&summary, "bcc %s\n", reader.Header.Get("Bcc"))
+
+			var copies []Message
+
+			for _, message := range box.Folder(account.Name, Sent) {
+				if message.MessageID == messageID {
+					copies = append(copies, message)
+				}
+			}
+
+			var copyBcc []string
+
+			for _, sentCopy := range copies {
+				for _, address := range sentCopy.Bcc {
+					copyBcc = append(copyBcc, address.Email)
+				}
+			}
+
+			fmt.Fprintf(&summary, "copies in Sent %d, with bcc %s\n", len(copies), strings.Join(copyBcc, " "))
 
 			for {
 				part, err := reader.NextPart()
@@ -378,4 +419,36 @@ func TestSend(t *testing.T) {
 			}
 		})
 	}
+}
+
+type sentFolderSession struct {
+	*imapmemserver.UserSession
+}
+
+func (sentFolderSession) Login(username, password string) error {
+	if username != "me@example.com" || password != "secret" {
+		return imapserver.ErrAuthFailed
+	}
+
+	return nil
+}
+
+func (sentFolderSession) List(w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
+	folders := []imap.ListData{
+		{Mailbox: "INBOX", Delim: '/'},
+		{Mailbox: "Sent", Delim: '/', Attrs: []imap.MailboxAttr{imap.MailboxAttrSent}},
+		{Mailbox: "Archive", Delim: '/'},
+		{Mailbox: "Junk", Delim: '/', Attrs: []imap.MailboxAttr{imap.MailboxAttrJunk}},
+		{Mailbox: "Deleted", Delim: '/', Attrs: []imap.MailboxAttr{imap.MailboxAttrTrash}},
+	}
+
+	for _, data := range folders {
+		err := w.WriteList(&data)
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
