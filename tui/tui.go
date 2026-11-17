@@ -155,7 +155,7 @@ var (
 	boldStyle = lipgloss.NewStyle().Bold(true)
 )
 
-var clickableKeys = []string{"A", "M", "!", "D", "E", "r", "R", "n", "ctrl+r", "L", "q", "ctrl+c", "/", "e", "s", "h", "l", "x", "u", "w", "y", "enter", "esc", "j", "k", "down", "up", "pgdown", "pgup", "home", "end", "?", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
+var clickableKeys = []string{"A", "M", "!", "D", "E", "r", "R", "n", "ctrl+r", "L", "q", "ctrl+c", "/", "e", "s", "h", "l", "x", "u", "w", "y", "enter", "esc", "j", "k", "down", "up", "pgdown", "pgup", "home", "end", "?", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
 
 // How the footer writes key names that aren't a single character.
 var keyNames = map[string]string{"down": "↓", "up": "↑", "left": "←", "right": "→", "pgdown": "pgdn"}
@@ -870,17 +870,23 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 
 		return m, tea.Batch(cmds...)
 
-	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
-		index := int(key[0] - '1')
+	case "0", "1", "2", "3", "4", "5", "6", "7", "8", "9":
+		row := 0
 
-		if index >= len(m.accounts) {
-			return m, nil
+		if key != "0" {
+			index := int(key[0] - '1')
+
+			if index >= len(m.accounts) {
+				return m, nil
+			}
+
+			row = slices.Index(m.folderRows, folderRow{account: m.accounts[index].Name, folder: mailbox.Inbox})
 		}
 
 		m.draftVisible = false
 		m.focus = listPane
 
-		return m, m.selectFolder(slices.Index(m.folderRows, folderRow{account: m.accounts[index].Name, folder: mailbox.Inbox}))
+		return m, m.selectFolder(row)
 
 	case "L":
 		m.logLines = m.options.Log.Entries()
@@ -1974,12 +1980,9 @@ func (m *Model) button(keys, label string) string {
 func (m *Model) footer() []string {
 	scroll := []string{m.button("j/down", "down"), m.button("k/up", "up"), m.button("pgdown", "page down"), m.button("pgup", "page up"), m.button("home", "top"), m.button("end", "bottom")}
 
-	jumpKeys := "1"
-	if len(m.accounts) > 1 {
-		jumpKeys += "-" + strconv.Itoa(min(9, len(m.accounts)))
-	}
+	jumpKeys := "0-" + strconv.Itoa(min(9, len(m.accounts)))
 
-	jump := m.zones.Mark("key:1", m.style(mutedColor).Bold(true).Render(jumpKeys)+" "+m.style(mutedColor).Render("jump to inbox"))
+	jump := m.zones.Mark("key:0", m.style(mutedColor).Bold(true).Render(jumpKeys)+" "+m.style(mutedColor).Render("jump to inbox"))
 
 	var buttons []string
 	hasOptional := false

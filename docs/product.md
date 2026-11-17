@@ -56,8 +56,9 @@ Everything you can see and do in scry. Anything not listed here is out.
   folders on the server, including Drafts, stay hidden.
 - An account's Outbox shows below its Inbox while it holds unsent email. It is
   hidden when empty.
-- The number keys along the top of the keyboard jump to each account's Inbox.
-  1 jumps to the first account's Inbox, 2 to the second, and so on up to 9.
+- The number keys along the top of the keyboard jump to an Inbox. 0 jumps to
+  All inboxes, 1 to the first account's Inbox, 2 to the second, and so on up
+  to 9.
 - Each folder shows its unread count. Spam shows its count only while selected.
 - Each account has its own colour, set by its order in the config. The colour
   marks the account everywhere: the sidebar, the email list, the draft, the
