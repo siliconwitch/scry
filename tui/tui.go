@@ -138,6 +138,10 @@ var (
 		{Light: "#15803D", Dark: "#79C879"},
 		{Light: "#0E7490", Dark: "#67D4E8"},
 		{Light: "#BE185D", Dark: "#F472B6"},
+		{Light: "#0F766E", Dark: "#2DD4BF"},
+		{Light: "#4D7C0F", Dark: "#A3E635"},
+		{Light: "#4338CA", Dark: "#A5B4FC"},
+		{Light: "#A21CAF", Dark: "#E879F9"},
 	}
 
 	boldStyle = lipgloss.NewStyle().Bold(true)
@@ -527,7 +531,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Subject:      msg.message.Subject,
 			From:         viewer.Address{Name: msg.message.From.Name, Email: msg.message.From.Email},
 			To:           recipients,
-			Date:         msg.message.Date.Format("Mon 2 Jan 2006, 15:04"),
+			Date:         msg.message.Date.Local().Format("Mon 2 Jan 2006, 15:04"),
 			HTML:         msg.message.HTML,
 			Text:         msg.message.Text,
 			Attachments:  attachments,
@@ -570,7 +574,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.delivering = false
 
 		if msg.err != nil {
-			m.options.Log.Write(msg.account, "Adding an email to the Outbox failed: %s", msg.err)
+			m.options.Log.Write(msg.account, "Adding an email to the Outbox failed. The draft shows why")
 			m.draftError = "Couldn't send: " + msg.err.Error()
 			m.draftVisible = true
 			return m, nil
@@ -662,6 +666,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.draftError = fmt.Sprintf("No account called %q. Use one of: %s.", edited.Account, strings.Join(names, ", "))
 		}
 
+		if strings.TrimSpace(edited.To) == "" && m.draftError == "" {
+			m.draftError = "Add a recipient on the To line before sending."
+		}
+
 		m.missingAttachments = nil
 
 		for _, path := range edited.Attach {
@@ -736,11 +744,10 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 		visibleLines := m.logRows()
 
 		switch key {
-		case "j", "down":
-			m.logOffset = min(m.logOffset+1, max(0, len(m.logEntries())-visibleLines))
+		case "j", "down", "k", "up", "pgdown", "pgup", "home", "end":
+			step := map[string]int{"j": 1, "down": 1, "k": -1, "up": -1, "pgdown": visibleLines, "pgup": -visibleLines, "home": -1 << 30, "end": 1 << 30}[key]
 
-		case "k", "up":
-			m.logOffset = max(m.logOffset-1, 0)
+			m.logOffset = max(0, min(m.logOffset+step, len(m.logEntries())-visibleLines))
 
 		case "1", "2", "3", "4", "5", "6", "7", "8", "9":
 			index := int(key[0] - '1')
@@ -929,6 +936,10 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 	case "M":
 		if !hasSelection {
 			return m, nil
+		}
+
+		if selected.Folder == mailbox.Outbox {
+			return m, m.setNotice(mailbox.ErrInOutbox.Error())
 		}
 
 		account, _ := m.options.Mail.Account(selected.Account)
@@ -1403,11 +1414,13 @@ func (m *Model) View() tea.View {
 		statusColor = redColor
 	}
 
-	logo := " " + m.zones.Mark("key:L", m.style(statusColor).Render("◉")) + m.style(accentColor).Bold(true).Render(" scry ")
+	logo := m.style(statusColor).Render("◉") + m.style(accentColor).Bold(true).Render(" scry ")
 
 	if m.syncing() && total > 0 {
 		logo += m.style(yellowColor).Render(fmt.Sprintf("%d%% ", done*100/total))
 	}
+
+	logo = " " + m.zones.Mark("key:L", logo)
 
 	searchWidth := min(48, m.width/2)
 
@@ -1623,6 +1636,7 @@ func (m *Model) View() tea.View {
 
 		focused := m.focus == listPane && !m.searchFocused
 		now := time.Now()
+		today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
 
 		for i := m.listOffset; i < min(len(m.messages), m.listOffset+m.listRows()); i++ {
 			message := m.messages[i]
@@ -1669,17 +1683,19 @@ func (m *Model) View() tea.View {
 				line += "  " + fit(m.style(m.accountColor(message.Account)).Render(message.Account), accountWidth)
 			}
 
-			date := message.Date.Format("Jan 06")
+			sent := message.Date.Local()
+			sentDay := time.Date(sent.Year(), sent.Month(), sent.Day(), 0, 0, 0, 0, time.Local)
+			date := sent.Format("Jan 06")
 
 			switch {
-			case message.Date.Year() == now.Year() && message.Date.YearDay() == now.YearDay():
-				date = message.Date.Format("15:04")
+			case sentDay.Equal(today):
+				date = sent.Format("15:04")
 
-			case now.Sub(message.Date) < 6*24*time.Hour:
-				date = message.Date.Format("Mon")
+			case !sentDay.Before(today.AddDate(0, 0, -6)):
+				date = sent.Format("Mon")
 
-			case message.Date.Year() == now.Year():
-				date = message.Date.Format("2 Jan")
+			case sent.Year() == now.Year():
+				date = sent.Format("2 Jan")
 			}
 
 			line += "  " + lipgloss.PlaceHorizontal(dateWidth, lipgloss.Right, m.style(mutedColor).Render(date))

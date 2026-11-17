@@ -3,6 +3,7 @@ package mailbox
 import (
 	"slices"
 	"strings"
+	"unicode/utf8"
 )
 
 type searchTerm struct {
@@ -75,10 +76,7 @@ func Search(messages []Message, query string) []Message {
 				personScore = max(personScore, matchScore(recipient.Email, term.value))
 			}
 
-			bodyScore := 0
-			if strings.Contains(strings.ToLower(message.Text), term.value) {
-				bodyScore = 50
-			}
+			bodyScore := matchScore(message.Text, term.value) / 2
 
 			var termScore int
 
@@ -148,36 +146,37 @@ func matchScore(text, value string) int {
 	}
 
 	valueRunes := []rune(value)
-	matched := 0
-	start := -1
-	end := -1
+	fewestGaps := 3
 
-	for position, character := range []rune(text) {
-		if matched == len(valueRunes) {
-			break
-		}
-
-		if character != valueRunes[matched] {
+	for start, first := range text {
+		if first != valueRunes[0] {
 			continue
 		}
 
-		if start < 0 {
-			start = position
+		_, width := utf8.DecodeRuneInString(text[start:])
+		matched := 1
+		consumed := 1
+
+		for _, character := range text[start+width:] {
+			if matched == len(valueRunes) || consumed == len(valueRunes)+2 {
+				break
+			}
+
+			consumed++
+
+			if character == valueRunes[matched] {
+				matched++
+			}
 		}
 
-		end = position
-		matched++
+		if matched == len(valueRunes) {
+			fewestGaps = min(fewestGaps, consumed-len(valueRunes))
+		}
 	}
 
-	if matched < len(valueRunes) {
+	if fewestGaps > 2 {
 		return 0
 	}
 
-	gaps := (end - start + 1) - len(valueRunes)
-
-	if gaps > 2 {
-		return 0
-	}
-
-	return 60 - gaps*10
+	return 60 - fewestGaps*10
 }

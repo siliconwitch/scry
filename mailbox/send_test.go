@@ -115,6 +115,11 @@ func TestSend(t *testing.T) {
 						fmt.Fprint(current, "250 ok\r\n")
 
 					case "RCPT":
+						if strings.Contains(argument, "unknown@") {
+							fmt.Fprintf(current, "550 5.1.1 %s no such user\r\n", argument)
+							continue
+						}
+
 						received.recipients = append(received.recipients, argument)
 						fmt.Fprint(current, "250 ok\r\n")
 
@@ -202,6 +207,12 @@ func TestSend(t *testing.T) {
 			wantErr:  "535",
 		},
 		{
+			name:     "smtp refuses a recipient",
+			password: "secret",
+			draft:    Draft{Account: "Personal", To: "unknown@example.com", Subject: "Hello", Body: "Hi."},
+			wantErr:  "recipient 1 of 1: the server replied with code 550",
+		},
+		{
 			name:         "unreadable To line",
 			password:     "secret",
 			draft:        Draft{Account: "Personal", To: "not an address", Subject: "Hello", Body: "Hi."},
@@ -287,6 +298,10 @@ func TestSend(t *testing.T) {
 				t.Fatalf("got error %v, want one containing %q", err, test.wantErr)
 
 			case test.wantErr != "":
+				if strings.Contains(err.Error(), test.draft.To) {
+					t.Errorf("the error names a recipient: %v", err)
+				}
+
 				select {
 				case <-deliveries:
 					t.Fatal("a failed send delivered an email")

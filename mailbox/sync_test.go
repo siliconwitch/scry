@@ -433,6 +433,49 @@ Rent statement attached.
 			},
 		},
 		{
+			name: "read dropped when deleted elsewhere",
+			action: func() error {
+				mail.Sync(context.Background(), "Personal", t.Logf)
+
+				inbox := mail.Folder("Personal", Inbox)
+
+				if len(inbox) != 1 {
+					return fmt.Errorf("inbox holds %d emails, want 1", len(inbox))
+				}
+
+				mail.MarkRead(inbox[0].ID)
+
+				client, err := imapclient.DialStartTLS(listener.Addr().String(), nil)
+
+				if err != nil {
+					return err
+				}
+
+				defer client.Close()
+
+				client.Login("me@example.com", "secret").Wait()
+				client.Select("INBOX", nil).Wait()
+				client.Store(imap.SeqSetNum(1), &imap.StoreFlags{Op: imap.StoreFlagsAdd, Flags: []imap.Flag{imap.FlagDeleted}}, nil).Close()
+				client.Expunge().Close()
+
+				reports = nil
+
+				return mail.Sync(context.Background(), "Personal", report)
+			},
+			wantErr: "the server has no Sent folder",
+			check: func(t *testing.T) {
+				inbox := subjects(mail, Inbox)
+
+				if inbox != "" {
+					t.Errorf("inbox: got %q", inbox)
+				}
+
+				if !slices.Contains(reports, "Inbox: marked 0 read on the server, dropped 1 already moved or deleted elsewhere") {
+					t.Errorf("reports: %q", reports)
+				}
+			},
+		},
+		{
 			name: "restart offline reads the mirror",
 			action: func() error {
 				server.Close()

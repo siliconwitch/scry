@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/smtp"
+	"net/textproto"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,6 +45,8 @@ const (
 )
 
 var ErrAlreadyThere = errors.New("already in that folder")
+
+var ErrInOutbox = errors.New("an email in the Outbox can't move until it is sent")
 
 type Address struct {
 	Name  string
@@ -307,7 +310,7 @@ func (b *Mailbox) Move(id, folder string) error {
 	}
 
 	if message.Folder == Outbox {
-		return errors.New("an email in the Outbox can't move until it is sent")
+		return ErrInOutbox
 	}
 
 	accountIndex := slices.IndexFunc(b.accounts, func(a Account) bool { return a.Name == message.Account })
@@ -630,6 +633,17 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 		report("Outbox: sending an email to %d recipients through %s", len(stored.Recipients), account.SMTP)
 
 		err = func() error {
+			// SMTP replies can quote addresses, which the sync log must never record.
+			serverError := func(step string, err error) error {
+				var reply *textproto.Error
+
+				if errors.As(err, &reply) {
+					return fmt.Errorf("%s: the server replied with code %d", step, reply.Code)
+				}
+
+				return fmt.Errorf("%s: %w", step, err)
+			}
+
 			host, port, err := net.SplitHostPort(account.SMTP)
 
 			if err != nil {
@@ -657,7 +671,7 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 
 			if err != nil {
 				connection.Close()
-				return fmt.Errorf("connecting to the smtp server: %w", err)
+				return serverError("connecting to the smtp server", err)
 			}
 
 			defer client.Close()
@@ -668,7 +682,7 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 				err = client.StartTLS(tlsConfig)
 
 				if err != nil {
-					return fmt.Errorf("starting TLS: %w", err)
+					return serverError("starting TLS", err)
 				}
 			}
 
@@ -677,7 +691,7 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 			err = client.Auth(smtp.PlainAuth("", account.Email, opened.password, host))
 
 			if err != nil {
-				return fmt.Errorf("signing in: %w", err)
+				return serverError("signing in", err)
 			}
 
 			connection.SetDeadline(time.Now().Add(time.Minute))
@@ -685,16 +699,16 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 			err = client.Mail(account.Email)
 
 			if err != nil {
-				return err
+				return serverError("starting the email", err)
 			}
 
-			for _, recipient := range stored.Recipients {
+			for i, recipient := range stored.Recipients {
 				connection.SetDeadline(time.Now().Add(time.Minute))
 
 				err = client.Rcpt(recipient)
 
 				if err != nil {
-					return fmt.Errorf("the server refused %s: %w", recipient, err)
+					return serverError(fmt.Sprintf("recipient %d of %d", i+1, len(stored.Recipients)), err)
 				}
 			}
 
@@ -703,7 +717,7 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 			data, err := client.Data()
 
 			if err != nil {
-				return err
+				return serverError("starting the data", err)
 			}
 
 			for chunk := range slices.Chunk(stored.Raw, 64<<10) {
@@ -712,7 +726,7 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 				_, err = data.Write(chunk)
 
 				if err != nil {
-					return err
+					return serverError("sending the data", err)
 				}
 			}
 
@@ -722,7 +736,7 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 			err = data.Close()
 
 			if err != nil {
-				return err
+				return serverError("finishing the email", err)
 			}
 
 			// The server has accepted the email once DATA ends, so a failed QUIT must not report a failed send.
@@ -912,32 +926,63 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 			continue
 		}
 
+		present := map[uint32]bool{}
 		known := opened.folders[folder]
 
-		if known.Server != server || known.UIDValidity != uidValidity {
+		if known.Server == server && known.UIDValidity == uidValidity {
+			present, err = session.Seen(pendingUIDs)
+
+			if err != nil {
+				report("%s: checking %d emails to mark read failed: %v", folder, len(pendingIDs), err)
+				failures = append(failures, fmt.Errorf("checking emails to mark read in %s: %w", folder, err))
+				continue
+			}
+		} else {
 			report("%s: the folder was rebuilt on the server, so its %d pending reads can't be matched", folder, len(pendingIDs))
-			continue
 		}
 
-		err = session.MarkSeen(pendingUIDs)
+		var presentIDs []string
+		var presentUIDs []uint32
+		dropped := 0
 
-		if err != nil {
-			report("%s: marking %d read failed: %v", folder, len(pendingIDs), err)
-			failures = append(failures, fmt.Errorf("marking email read in %s: %w", folder, err))
-			continue
+		b.mutex.Lock()
+
+		for i, id := range pendingIDs {
+			_, onServer := present[pendingUIDs[i]]
+
+			if !onServer {
+				delete(b.pendingSeen, id)
+				dropped++
+				continue
+			}
+
+			presentIDs = append(presentIDs, id)
+			presentUIDs = append(presentUIDs, pendingUIDs[i])
+		}
+
+		b.mutex.Unlock()
+
+		if len(presentUIDs) > 0 {
+			err = session.MarkSeen(presentUIDs)
+
+			if err != nil {
+				report("%s: marking %d read failed: %v", folder, len(presentUIDs), err)
+				failures = append(failures, fmt.Errorf("marking email read in %s: %w", folder, err))
+				continue
+			}
 		}
 
 		b.mutex.Lock()
 
-		for _, id := range pendingIDs {
+		for _, id := range presentIDs {
 			delete(b.pendingSeen, id)
 		}
 
 		b.mutex.Unlock()
 
-		report("%s: marked %d read on the server", folder, len(pendingIDs))
+		report("%s: marked %d read on the server, dropped %d already moved or deleted elsewhere", folder, len(presentIDs), dropped)
 
-		pushedReads += len(pendingIDs)
+		pushedReads += len(presentIDs)
 	}
 
 	if pushedReads == 0 {
@@ -1213,14 +1258,16 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 							downloaded := map[string]string{}
 
 							for node := range document.Descendants() {
-								if node.Type != html.ElementNode || node.Data != "img" {
+								if node.Type != html.ElementNode {
 									continue
 								}
 
 								node.Attr = slices.DeleteFunc(node.Attr, func(attribute html.Attribute) bool { return attribute.Key == "srcset" })
 
 								for a, attribute := range node.Attr {
-									if attribute.Key != "src" || !(strings.HasPrefix(attribute.Val, "https://") || strings.HasPrefix(attribute.Val, "http://")) {
+									isImage := (node.Data == "img" && attribute.Key == "src") || attribute.Key == "background"
+
+									if !isImage || !(strings.HasPrefix(attribute.Val, "https://") || strings.HasPrefix(attribute.Val, "http://")) {
 										continue
 									}
 

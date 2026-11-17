@@ -19,11 +19,21 @@ type Entry struct {
 type Log struct {
 	mutex     sync.Mutex
 	directory string
+	keepDays  int
+	day       string
 	entries   []Entry
 }
 
 func Open(directory string, keepDays int) (*Log, error) {
 	err := os.MkdirAll(directory, 0o700)
+
+	if err != nil {
+		return nil, err
+	}
+
+	log := &Log{directory: directory, keepDays: keepDays}
+
+	err = log.prune(time.Now())
 
 	if err != nil {
 		return nil, err
@@ -35,26 +45,13 @@ func Open(directory string, keepDays int) (*Log, error) {
 		return nil, err
 	}
 
-	cutoff := time.Now().AddDate(0, 0, -keepDays)
-
 	var names []string
 
 	for _, entry := range entries {
-		day, err := time.ParseInLocation("2006-01-02.log", entry.Name(), time.Local)
+		_, err := time.ParseInLocation("2006-01-02.log", entry.Name(), time.Local)
 
-		if err != nil {
-			continue
-		}
-
-		if !day.Before(cutoff) {
+		if err == nil {
 			names = append(names, entry.Name())
-			continue
-		}
-
-		err = os.Remove(filepath.Join(directory, entry.Name()))
-
-		if err != nil {
-			return nil, err
 		}
 	}
 
@@ -82,7 +79,44 @@ func Open(directory string, keepDays int) (*Log, error) {
 		}
 	}
 
-	return &Log{directory: directory, entries: loaded}, nil
+	log.entries = loaded
+
+	return log, nil
+}
+
+func (l *Log) prune(now time.Time) error {
+	l.day = now.Format("2006-01-02")
+	cutoff := now.AddDate(0, 0, -l.keepDays)
+
+	entries, err := os.ReadDir(l.directory)
+
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		day, err := time.ParseInLocation("2006-01-02.log", entry.Name(), time.Local)
+
+		if err != nil || !day.Before(cutoff) {
+			continue
+		}
+
+		err = os.Remove(filepath.Join(l.directory, entry.Name()))
+
+		if err != nil {
+			return err
+		}
+	}
+
+	// Entries returns a view of this slice, so filter a copy.
+	l.entries = slices.DeleteFunc(slices.Clone(l.entries), func(entry Entry) bool {
+		date, _, _ := strings.Cut(entry.Time, " ")
+		day, err := time.ParseInLocation("2006-01-02", date, time.Local)
+
+		return err == nil && day.Before(cutoff)
+	})
+
+	return nil
 }
 
 func (l *Log) Write(account, format string, arguments ...any) {
@@ -91,6 +125,10 @@ func (l *Log) Write(account, format string, arguments ...any) {
 
 	now := time.Now()
 	stamp := now.Format("2006-01-02 15:04:05")
+
+	if now.Format("2006-01-02") != l.day {
+		l.prune(now)
+	}
 
 	var written []Entry
 	var content strings.Builder

@@ -28,6 +28,8 @@ func TestSearch(t *testing.T) {
 		{query: "subject:bridge", want: nil},
 		{query: "body:bridge", want: []string{"walk"}},
 		{query: `body:"car park"`, want: []string{"walk"}},
+		{query: "body:brdge", want: []string{"walk"}},
+		{query: "body:sat", want: []string{"flight"}},
 		{query: "nr8k2qx", want: []string{"ticket"}},
 		{query: "alex nothing-matches", want: nil},
 		{query: "zz", want: nil},
