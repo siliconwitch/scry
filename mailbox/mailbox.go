@@ -1092,10 +1092,15 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 			continue
 		}
 
+		heldNoun := "emails"
+		if len(uids) == 1 {
+			heldNoun = "email"
+		}
+
 		if since.IsZero() {
-			report("%s: the server holds %d emails", folder, len(uids))
+			report("%s: the server holds %d %s", folder, len(uids), heldNoun)
 		} else {
-			report("%s: the server holds %d emails from the last %d days", folder, len(uids), b.historyDays)
+			report("%s: the server holds %d %s from the last %d days", folder, len(uids), heldNoun, b.historyDays)
 		}
 
 		seen, err := session.Seen(uids)
@@ -1249,9 +1254,15 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 
 		selectedValidity, err := session.Select(planned.server)
 
-		if err != nil || selectedValidity != uidValidity {
+		if err != nil {
+			report("%s: opening the folder to download failed: %v", folder, err)
+			failures = append(failures, fmt.Errorf("opening %s: %w", folder, err))
+			continue
+		}
+
+		if selectedValidity != uidValidity {
 			report("%s: the folder changed during sync, so its downloads wait for the next sync", folder)
-			failures = append(failures, fmt.Errorf("%s changed during sync. Press Ctrl+R to try again", folder))
+			failures = append(failures, fmt.Errorf("%s changed during sync", folder))
 			continue
 		}
 
