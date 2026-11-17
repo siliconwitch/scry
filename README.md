@@ -75,7 +75,8 @@ CGO_ENABLED=0 go build -o scry .
 sudo install -Dm755 scry /usr/local/bin/scry
 ```
 
-On Nix, `nix develop` gives you the same toolchain.
+On Nix, run `nix develop` for the same toolchain, or `direnv allow` once with
+[direnv](https://direnv.net) hooked into your shell.
 
 ## Configure
 

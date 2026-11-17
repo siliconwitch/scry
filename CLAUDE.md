@@ -74,12 +74,14 @@ Never loosen any of these.
 
 ## Build and test
 
-Build, vet and test with cgo disabled:
+Run every `go`, `gofmt` and `goreleaser` command through `nix develop -c`.
+The dev shell provides the Go version that `go.mod` names, and sets
+`CGO_ENABLED=0`.
 
 ```sh
-CGO_ENABLED=0 go build -o scry .
-CGO_ENABLED=0 go vet ./...
-CGO_ENABLED=0 go test ./...
+nix develop -c go build -o scry .
+nix develop -c go vet ./...
+nix develop -c go test ./...
 ```
 
 To check a layout without a terminal, write a temporary test in `tui`. Send a
@@ -128,14 +130,14 @@ the AUR.
 5. Run every check. Stop and report any failure.
 
    ```sh
-   gofmt -l .
-   go mod tidy
+   nix develop -c gofmt -l .
+   nix develop -c go mod tidy
    git status --porcelain -- go.mod go.sum
-   CGO_ENABLED=0 go vet ./...
-   CGO_ENABLED=0 go test ./...
-   CGO_ENABLED=0 go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+   nix develop -c go vet ./...
+   nix develop -c go test ./...
+   nix develop -c go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
    nix build path:.#scry --no-link
-   nix develop path:. -c goreleaser check
+   nix develop -c goreleaser check
    ```
 
 6. Commit and push the version bump:
@@ -257,7 +259,7 @@ that fixes it.
 1. Reproduce the finding locally:
 
    ```sh
-   CGO_ENABLED=0 go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+   nix develop -c go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
    ```
 
 2. Apply the fix:
@@ -265,14 +267,14 @@ that fixes it.
    - For a module, raise it to the fixed version:
 
      ```sh
-     go get <module>@<fixed version>
-     go mod tidy
+     nix develop -c go get <module>@<fixed version>
+     nix develop -c go mod tidy
      ```
 
    - For the standard library, raise the minimum Go version:
 
      ```sh
-     go mod edit -go=<fixed version>
+     nix develop -c go mod edit -go=<fixed version>
      ```
 
      When the Go minor version changes, also change `buildGo127Module` and
