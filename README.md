@@ -13,10 +13,29 @@ window beside it.
   read an email. Scripts never run, and nothing loads for Spam or Trash.
 - Write in `$EDITOR` with `**bold**` and `-` bullet lists. scry sends plain
   text and HTML versions of each email.
+- Open attachments in the viewer without saving them: images, PDFs, Word,
+  Excel and PowerPoint files, video and audio, and text files such as CSV and
+  Markdown. Text in PDFs and Office files can be selected and copied.
+  Attachments never contact the network, and scripts and macros in them
+  never run.
 
 Built in Go with [Bubble Tea](https://github.com/charmbracelet/bubbletea) and
-[Lip Gloss](https://github.com/charmbracelet/lipgloss). It ships as a single
-static binary.
+[Lip Gloss](https://github.com/charmbracelet/lipgloss). The viewer renders PDFs
+with [EmbedPDF](https://github.com/embedpdf/embed-pdf-viewer) and Office files
+with [@silurus/ooxml](https://github.com/yukiyokotani/office-open-xml-viewer).
+It ships as a single static binary with both built in.
+
+## Requirements
+
+- A web browser for the viewer. scry is tested with Chromium, opened as an app
+  window with `chromium --app=%s`. Playing MP4 video needs a browser built with
+  H.264 support, which most are.
+- A password manager with a command line, or a script that prints each
+  password. See [Passwords](#passwords).
+- An editor in `$EDITOR` for writing email.
+
+scry needs nothing else at runtime. The PDF and Office viewers are part of the
+binary.
 
 ## Install
 
@@ -66,7 +85,8 @@ sudo install -Dm755 scry /usr/local/bin/scry
 
 ## Build it yourself
 
-You need [Go](https://go.dev) 1.27 or newer.
+You need [Go](https://go.dev) 1.27 or newer. The viewer's PDF and Office
+libraries are checked in under `viewer/`, so nothing else is needed.
 
 ```sh
 git clone https://github.com/siliconwitch/scry.git
