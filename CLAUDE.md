@@ -4,6 +4,8 @@ Rules for agents changing scry. Product behaviour lives in `docs/product.md`.
 
 ## Product spec
 
+- It states what scry does and why, as a user sees it. Leave how it works,
+  such as timings, protocols and formats, to the code.
 - `docs/product.md` belongs to Raj. Edit it only when asked.
 - When the code and the spec disagree, say so and change neither.
 - When a change would make the spec wrong, point out the exact lines.

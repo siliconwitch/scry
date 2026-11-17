@@ -69,18 +69,15 @@ Everything you can see and do in scry. Anything not listed here is out.
   subject, an attachment mark and the date.
 - The combined Inbox and search results also show each email's account. Search
   results also show its folder.
-- The date shows the time for today, the weekday for the last 6 days, the day
-  and month for this year, and the month and year before that.
+- Dates are short and relative to today.
 
 ### Reading
 
-- The selected email shows in the viewer. It is marked read only while the
-  email list has focus.
-- Choosing a folder selects its first email. From the sidebar, that email
-  stays unread until you move to the email list. The number keys focus the
-  email list, so they mark it read.
-- scry opens with the email list focused on the combined Inbox. Once the
-  mirror opens, its first email is selected and marked read.
+- The selected email shows in the viewer.
+- An email is marked read when you look at it in the email list, not when you
+  pass it from the sidebar.
+- Choosing a folder selects its first email.
+- scry opens on the combined Inbox with its first email selected.
 - The config can name a browser command that opens the viewer at startup, such
   as `chromium --app=%s`. The sync log view shows the viewer's address for any
   browser.
@@ -90,11 +87,7 @@ Everything you can see and do in scry. Anything not listed here is out.
   Clicking a name or address copies it.
 - The viewer lists attachments. Clicking an image or PDF shows it in place of
   the email. Clicking any other attachment downloads it.
-- While an attachment shows, the viewer's top bar has arrows to step through
-  the email's images and PDFs, a download button and a button back to the
-  email.
-- In a PDF you can select and copy text. Its links open with `links`, and a
-  link to another page scrolls there.
+- You can step through an email's images and PDFs without leaving the viewer.
 - Clicking a link in an email opens it with the browser command that `links`
   names in the config, such as `firefox %s`. Only `http` and `https` links
   open.
@@ -126,8 +119,7 @@ Everything you can see and do in scry. Anything not listed here is out.
 
 - `n` starts a new email. `R` replies to the sender. `r` replies to the sender
   and every recipient.
-- scry opens the email in `$VISUAL`. Without it, scry uses `$EDITOR`, then
-  `vi`. Header lines set From, To, Cc, Bcc, Subject and Attach, then a blank
+- scry opens the email in your editor. Header lines set From, To, Cc, Bcc, Subject and Attach, then a blank
   line starts the body.
 - Bcc recipients get the email, but no recipient sees the Bcc line.
 - A reply quotes the original, adds `Re:` to the subject and threads under the
@@ -144,8 +136,7 @@ Everything you can see and do in scry. Anything not listed here is out.
 - The draft lives only in memory and is gone when scry closes.
 - `e` edits the draft, `h` hides it to browse mail, `w` returns to it and `x`
   discards it.
-- The draft shows what blocks sending: an unknown header line, an unknown
-  account, a missing attachment or an empty To line.
+- The draft shows anything that would stop it sending.
 - Starting a new email or reply while a draft exists asks before discarding
   the draft.
 
@@ -174,25 +165,12 @@ Everything you can see and do in scry. Anything not listed here is out.
 
 - Every action in the terminal has a keybind and a mouse equivalent. The
   viewer is mouse only.
-- The footer shows, as buttons, the essential keys that work in the current
-  view, and no others.
-  - In the email list: reply, reply all, archive, delete, empty Trash, new,
-    return to the draft, search, clear search and quit.
-  - In the draft: edit, send, discard, hide and quit.
-  - In the sync log: the account filters, close and quit.
-  - Every other view shows all of its keys.
-- `?` shows every key that works in the current view. `?` again shows only the
-  essential keys.
-- The footer orders keys from the selected email outwards: actions on the
-  email, then writing, then finding mail, then sync, log and quit.
-- The number keys show as one button, such as `1-3 jump to inbox`.
-- The footer keeps wide gaps between buttons, and wraps onto more rows when
-  they don't fit.
+- The footer shows the essential keys for the current view. `?` shows them
+  all.
 - `j` and `k`, Up and Down, Page Up, Page Down, Home and End move through a
   list.
 - Tab switches between the sidebar and the email list. `h` or Left focuses
-  the sidebar. `l`, Right or Enter focuses the email list, which marks the
-  selected email read.
+  the sidebar. `l`, Right or Enter focuses the email list.
 - Clicking an email selects it and shows it in the viewer. Clicking a folder,
   button or icon runs it.
 - The mouse wheel scrolls lists.
@@ -209,8 +187,6 @@ Everything scry does that you don't see or drive directly.
   and changes waiting for a sync. It holds nothing else.
 - Archive and Sent keep the last `history-days` of mail, 365 by default. Every
   other folder is mirrored in full.
-- Each account's mirror is encrypted with a key derived from that account's
-  password.
 - When an account's password changes, scry deletes that account's mirror and
   downloads it again from the server. The account's Outbox and any changes
   waiting for a sync are lost, because only the mirror holds them.
@@ -221,18 +197,14 @@ Everything scry does that you don't see or drive directly.
 - Before applying a queued action, scry checks the email's current state on
   the server. If another client already moved or deleted the email, scry drops
   the action and notes it in the sync log. A dropped action is not an error.
-- Moving email needs a server with the UIDPLUS extension, which reports where
-  a moved email lands. Gmail, Fastmail and Dovecot have it. Without it, scry
-  would have to download the email again and fetch its images a second time.
+- Moving and deleting email need a server with the UIDPLUS extension. Gmail,
+  Fastmail and Dovecot have it.
 
 ### Privacy
 
 - scry downloads every remote image in a new email during sync, whether or not
   you read it. A tracking image then shows the sender only that the email was
   delivered, not whether or when you read it.
-- A remote image means an `<img>` source or a `background` attribute with an
-  `http://` or `https://` address. Images set any other way, such as in CSS,
-  stay blank.
 - scry fetches nothing for Spam or Trash, so spammers can't confirm your
   address is live. Images in Spam and Trash stay blank.
 - An email moved out of Spam or Trash into another folder gets its images at
@@ -244,8 +216,7 @@ Everything scry does that you don't see or drive directly.
 - Scripts in email never run. The viewer shows images from the mirror and
   never contacts the network.
 - The viewer never opens a link itself. Links go to the `links` browser.
-- PDFs render with a copy of pdf.js built into scry. Scripts in a PDF never
-  run.
+- Scripts in a PDF never run.
 
 ### Passwords
 
@@ -257,41 +228,26 @@ Everything scry does that you don't see or drive directly.
 
 ### Sync
 
-- Every sync works the same way. It sends the Outbox, applies your moves,
-  empties Trash, pushes your reads, then fetches new mail and changes made in
-  other clients.
 - Each account syncs on its own, so a slow or offline account never holds up
   the others.
-- scry syncs when it opens, after you read, archive, move, spam, delete or send
-  an email, after you empty Trash, and every 10 minutes.
-- scry keeps a connection open to each account's Inbox. The server reports new
-  mail and changes from other clients on it, and scry syncs at once.
-- When that connection drops, scry reconnects and syncs after 10 seconds,
-  doubling the wait up to 5 minutes.
-- An action during a sync queues another sync, which starts when the current
-  one ends. One queued sync covers every action taken while it waits.
+- New mail and changes from other clients show up within seconds.
 
 ### Network
 
 - Sync expects a flaky network: sleep and wake, switching networks, phone
   tethering and airline wifi.
-- A dead connection never stalls scry. A connection that goes quiet for a
-  minute in the middle of a step is dropped and the sync fails.
-- After a failed sync, scry retries after 10 seconds, doubling the wait up to
-  5 minutes, until the server answers.
+- A dead connection never stalls scry.
+- scry keeps retrying a failed sync, waiting longer each time.
 - scry syncs as soon as the machine wakes.
 
 ### Sending
 
 - **No accidental sends.** Every send waits 5 seconds before it moves to the
   Outbox.
-- When the countdown ends, the email moves to its account's Outbox. scry reads
-  the signature and attachments at that moment.
+- When the countdown ends, the email moves to its account's Outbox.
 - Sync sends the Outbox. An email that fails to send stays there and is retried
   on every sync, until it is sent or returned to the draft.
-- Before sending, scry checks the Sent folder for the email, so an email that
-  an interrupted earlier try already sent isn't sent twice.
-- scry sends a plain text version and an HTML version of the same email.
+- An interrupted send is never sent twice.
 - A sent email lands in its account's Sent folder.
 
 ### Sync log
