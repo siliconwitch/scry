@@ -11,8 +11,8 @@ window beside it.
 - Configured in one text file that can live in your dotfiles.
 - Every remote image downloads at sync, so tracking pixels can't tell when you
   read an email. Scripts never run, and nothing loads for Spam or Trash.
-- Write in `$EDITOR` with `**bold**` and `-` bullet lists. scry sends plain
-  text and HTML versions of each email.
+- Write in `$EDITOR` with `**bold**`, `-` bullet lists and `![alt](path)`
+  inline images. scry sends plain text and HTML versions of each email.
 - Open attachments in the viewer without saving them: images, PDFs, Word,
   Excel and PowerPoint files, video and audio, and text files such as CSV and
   Markdown. Text in PDFs and Office files can be selected and copied.
@@ -149,6 +149,7 @@ colour and its number key, so `1` jumps to the first account's Inbox.
 | Field          | Purpose                                                                 |
 | -------------- | ----------------------------------------------------------------------- |
 | `name`         | The account's label in scry                                             |
+| `display-name` | Optional name recipients see beside your address                       |
 | `email`        | The address you log in and send with                                    |
 | `imap`         | `host:port`. Port 993 uses TLS. Other ports use STARTTLS.               |
 | `smtp`         | `host:port`. Port 465 uses TLS. Other ports use STARTTLS.               |

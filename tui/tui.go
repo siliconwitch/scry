@@ -111,6 +111,8 @@ type editorDoneMsg struct {
 
 const sendDelay = 5
 
+const quoteMarker = "[The email you're replying to is quoted below your signature. Delete this line to leave it out.]"
+
 const folderPaneWidth = 24
 
 const heartbeatInterval = 15 * time.Second
@@ -661,7 +663,19 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		headerBlock, body, _ := strings.Cut(string(content), "\n\n")
 
-		edited := mailbox.Draft{ReplyTo: m.draft.ReplyTo, Body: strings.TrimRight(body, "\n")}
+		var bodyLines []string
+		quote := false
+
+		for _, line := range strings.Split(body, "\n") {
+			if strings.TrimSpace(line) == quoteMarker {
+				quote = true
+				continue
+			}
+
+			bodyLines = append(bodyLines, line)
+		}
+
+		edited := mailbox.Draft{ReplyTo: m.draft.ReplyTo, Quote: quote, Body: strings.TrimRight(strings.Join(bodyLines, "\n"), "\n")}
 
 		for _, line := range strings.Split(headerBlock, "\n") {
 			if strings.TrimSpace(line) == "" {
@@ -1270,11 +1284,6 @@ func (m *Model) startCompose(replyID string, replyAll bool) tea.Cmd {
 			subject = "Re: " + subject
 		}
 
-		var quoted strings.Builder
-		for _, line := range strings.Split(original.Text, "\n") {
-			quoted.WriteString("> " + line + "\n")
-		}
-
 		recipients := []string{original.From.Email}
 		var copied []string
 
@@ -1304,8 +1313,8 @@ func (m *Model) startCompose(replyID string, replyAll bool) tea.Cmd {
 			To:      strings.Join(recipients, ", "),
 			Cc:      strings.Join(copied, ", "),
 			Subject: subject,
-			Body:    "\n\nOn " + original.Date.Format("Mon 2 Jan 2006 at 15:04") + ", " + original.From.Short() + " wrote:\n" + quoted.String(),
 			ReplyTo: original.ID,
+			Quote:   true,
 		}
 	}
 
@@ -1345,6 +1354,10 @@ func (m *Model) openEditor() tea.Cmd {
 	}
 
 	content.WriteString("\n" + m.draft.Body + "\n")
+
+	if m.draft.Quote {
+		content.WriteString("\n" + quoteMarker + "\n")
+	}
 
 	_, err = file.WriteString(content.String())
 
@@ -1694,7 +1707,13 @@ func (m *Model) View() tea.View {
 		}
 
 		bodyHeight := max(0, innerHeight-len(lines)-statusLines)
-		body := lipgloss.NewStyle().Width(rightInnerWidth - 2).Render(draft.Body)
+		bodyText := draft.Body
+
+		if draft.Quote {
+			bodyText += "\n\n" + quoteMarker
+		}
+
+		body := lipgloss.NewStyle().Width(rightInnerWidth - 2).Render(bodyText)
 		bodyLines := strings.Split(body, "\n")
 
 		for _, line := range bodyLines[:min(len(bodyLines), bodyHeight)] {

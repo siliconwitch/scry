@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
@@ -156,11 +157,13 @@ func TestSend(t *testing.T) {
 	directory := t.TempDir()
 	signaturePath := filepath.Join(directory, "signature.html")
 	attachmentPath := filepath.Join(directory, "notes.txt")
+	imagePath := filepath.Join(directory, "route.png")
 
 	os.WriteFile(signaturePath, []byte("<p>Kit Hale<br>Hollow Lane Club</p>"), 0o600)
 	os.WriteFile(attachmentPath, []byte("Bring boots."), 0o600)
+	os.WriteFile(imagePath, []byte("fake png"), 0o600)
 
-	account := Account{Name: "Personal", Email: "me@example.com", IMAP: imapListener.Addr().String(), SMTP: listener.Addr().String(), Signature: signaturePath, PasswordCommand: "echo secret"}
+	account := Account{Name: "Personal", DisplayName: "Kit Hale", Email: "me@example.com", IMAP: imapListener.Addr().String(), SMTP: listener.Addr().String(), Signature: signaturePath, PasswordCommand: "echo secret"}
 
 	cases := []struct {
 		name         string
@@ -192,6 +195,7 @@ func TestSend(t *testing.T) {
 			},
 			want: []string{
 				"from FROM:<me@example.com>\n",
+				"from-header \"Kit Hale\" <me@example.com>\n",
 				"recipients TO:<alex@example.com> TO:<sam@example.net> TO:<robin@example.org> TO:<kim@example.net>\n",
 				"cc \"Robin Hale\" <robin@example.org>\n",
 				"bcc \n",
@@ -213,6 +217,39 @@ func TestSend(t *testing.T) {
 				"references <plan@example.com> <walk@example.com>\n",
 				"copies in Sent 1, with bcc \n",
 			},
+		},
+		{
+			name:     "inline image",
+			password: "secret",
+			draft:    Draft{Account: "Personal", To: "alex@example.com", Subject: "Route", Body: "Route: ![the route](" + imagePath + ")"},
+			want: []string{
+				"text/plain: Route: the route\n",
+				`text/html: <p>Route: <img src="cid:image1.`,
+				`" alt="the route"></p>`,
+				"image/png referenced true: fake png\n",
+			},
+		},
+		{
+			name:         "missing inline image",
+			password:     "secret",
+			draft:        Draft{Account: "Personal", To: "alex@example.com", Subject: "Route", Body: "![route](" + filepath.Join(directory, "gone.png") + ")"},
+			wantQueueErr: "reading the image gone.png",
+		},
+		{
+			name:     "reply quotes the original email unchanged",
+			password: "secret",
+			draft:    Draft{Account: "Personal", To: "alex@example.com", Subject: "Re: Saturday walk?", Body: "Yes.", ReplyTo: "original", Quote: true},
+			want: []string{
+				"text/plain: Yes.\n\nKit Hale\nHollow Lane Club\n\nOn Sun 1 Nov 2026 at 09:00, Alex Moreno wrote:\n> Walk?\n> - boots\n",
+				`<p>Kit Hale<br>Hollow Lane Club</p><p>On Sun 1 Nov 2026 at 09:00, Alex Moreno wrote:</p><blockquote style="margin:0 0 0 0.8ex;border-left:1px solid #ccc;padding-left:1ex"><style>p{color:green}</style><p>Walk?</p><img src="cid:image1.`,
+				"image/png referenced true: fake png\n",
+			},
+		},
+		{
+			name:         "reply quoting an email missing from the mirror",
+			password:     "secret",
+			draft:        Draft{Account: "Personal", To: "alex@example.com", Subject: "Re: Lost", Body: "Yes.", ReplyTo: "unstored", Quote: true},
+			wantQueueErr: "reading the email you're replying to",
 		},
 		{
 			name:        "server files its own copy in Sent",
@@ -260,7 +297,15 @@ func TestSend(t *testing.T) {
 
 			box := New([]Account{account}, t.TempDir(), 365)
 			box.Sync(context.Background(), account.Name, t.Logf)
-			box.messages = append(box.messages, Message{ID: "original", Account: account.Name, MessageID: "walk@example.com", References: []string{"plan@example.com"}})
+			box.messages = append(box.messages,
+				Message{ID: "original", Account: account.Name, MessageID: "walk@example.com", References: []string{"plan@example.com"}, From: Address{Name: "Alex Moreno", Email: "alex@example.com"}, Date: time.Date(2026, 11, 1, 9, 0, 0, 0, time.Local), Text: "Walk?\n- boots"},
+				Message{ID: "unstored", Account: account.Name, MessageID: "lost@example.com"},
+			)
+
+			var original bytes.Buffer
+
+			gob.NewEncoder(&original).Encode(storedBody{HTML: `<html><head><meta charset="utf-8"><style>p{color:green}</style></head><body><p>Walk?</p><img src="data:image/png;base64,ZmFrZSBwbmc="></body></html>`})
+			box.opened[account.Name].mirror.Write(bodyFile("original"), original.Bytes())
 
 			err := box.Queue(test.draft)
 
@@ -363,6 +408,7 @@ func TestSend(t *testing.T) {
 			var summary strings.Builder
 
 			fmt.Fprintf(&summary, "from %s\n", received.from)
+			fmt.Fprintf(&summary, "from-header %s\n", reader.Header.Get("From"))
 			fmt.Fprintf(&summary, "recipients %s\n", strings.Join(received.recipients, " "))
 			fmt.Fprintf(&summary, "message-id host %s\n", messageHost)
 			fmt.Fprintf(&summary, "in-reply-to %s\n", reader.Header.Get("In-Reply-To"))
@@ -388,6 +434,8 @@ func TestSend(t *testing.T) {
 
 			fmt.Fprintf(&summary, "copies in Sent %d, with bcc %s\n", len(copies), strings.Join(copyBcc, " "))
 
+			htmlPart := ""
+
 			for {
 				part, err := reader.NextPart()
 
@@ -405,7 +453,19 @@ func TestSend(t *testing.T) {
 				switch header := part.Header.(type) {
 				case *mail.InlineHeader:
 					contentType, _, _ := header.ContentType()
-					fmt.Fprintf(&summary, "%s: %s\n", contentType, text)
+					contentID := strings.Trim(header.Get("Content-Id"), "<>")
+
+					switch {
+					case contentID != "":
+						fmt.Fprintf(&summary, "%s referenced %t: %s\n", contentType, strings.Contains(htmlPart, "cid:"+contentID), text)
+
+					case contentType == "text/html":
+						htmlPart = text
+						fmt.Fprintf(&summary, "%s: %s\n", contentType, text)
+
+					default:
+						fmt.Fprintf(&summary, "%s: %s\n", contentType, text)
+					}
 
 				case *mail.AttachmentHeader:
 					filename, _ := header.Filename()

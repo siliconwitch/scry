@@ -32,6 +32,7 @@ type config struct {
 
 type accountConfig struct {
 	Name            string   `toml:"name"`
+	DisplayName     string   `toml:"display-name"`
 	Email           string   `toml:"email"`
 	IMAP            string   `toml:"imap"`
 	SMTP            string   `toml:"smtp"`
@@ -164,7 +165,7 @@ func main() {
 			signature = filepath.Join(home, rest)
 		}
 
-		accounts = append(accounts, mailbox.Account{Name: account.Name, Email: account.Email, IMAP: account.IMAP, SMTP: account.SMTP, Signature: signature, PasswordCommand: account.PasswordCommand, Folders: account.Folders, HideFromCombinedInbox: account.CombinedInbox != nil && !*account.CombinedInbox})
+		accounts = append(accounts, mailbox.Account{Name: account.Name, DisplayName: account.DisplayName, Email: account.Email, IMAP: account.IMAP, SMTP: account.SMTP, Signature: signature, PasswordCommand: account.PasswordCommand, Folders: account.Folders, HideFromCombinedInbox: account.CombinedInbox != nil && !*account.CombinedInbox})
 	}
 
 	if len(problems) > 0 {

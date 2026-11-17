@@ -131,11 +131,15 @@ Everything you can see and do in scry. Anything not listed here is out.
 - scry opens the email in your editor. Header lines set From, To, Cc, Bcc, Subject and Attach, then a blank
   line starts the body.
 - Bcc recipients get the email, but no recipient sees the Bcc line.
-- A reply quotes the original, adds `Re:` to the subject and threads under the
-  original.
+- A reply quotes the original email unchanged, below your signature, adds
+  `Re:` to the subject and threads under the original.
+- The editor shows one line in place of the quoted email. Deleting the line
+  leaves the quote out.
 - A reply starts from the account the original email arrived in.
-- You write plain text, with `**bold**` and `-` bullet lists.
+- You write plain text, with `**bold**`, `-` bullet lists and `![alt](path)`
+  inline images.
 - Each account can name an HTML file as its signature.
+- Each account can set the name recipients see beside its address.
 - Images and files can be attached, one Attach line each.
 
 ### The draft
@@ -277,6 +281,7 @@ history-days = 365
 
 [[account]]
 name = "Personal"
+display-name = "Kit Hale"
 email = "me@example.com"
 imap = "imap.gmail.com:993"
 smtp = "smtp.gmail.com:465"

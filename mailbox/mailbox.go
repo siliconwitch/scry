@@ -21,12 +21,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	mimemessage "github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	mimeheader "github.com/emersion/go-message/textproto"
 	"golang.org/x/net/html"
@@ -92,6 +94,7 @@ type Message struct {
 
 type Account struct {
 	Name                  string
+	DisplayName           string
 	Email                 string
 	IMAP                  string
 	SMTP                  string
@@ -110,6 +113,7 @@ type Draft struct {
 	Attach  []string
 	Body    string
 	ReplyTo string
+	Quote   bool
 }
 
 type Mailbox struct {
@@ -1731,7 +1735,7 @@ func (b *Mailbox) Queue(draft Draft) error {
 	var header mail.Header
 
 	header.SetDate(now)
-	header.SetAddressList("From", []*mail.Address{{Address: account.Email}})
+	header.SetAddressList("From", []*mail.Address{{Name: account.DisplayName, Address: account.Email}})
 	header.SetAddressList("To", recipients)
 	header.SetAddressList("Cc", cc)
 	header.SetSubject(draft.Subject)
@@ -1755,6 +1759,16 @@ func (b *Mailbox) Queue(draft Draft) error {
 		header.SetMsgIDList("References", append(slices.Clone(original.References), original.MessageID))
 	}
 
+	imagePattern := regexp.MustCompile(`!\[([^\]]*)\]\(([^)]+)\)`)
+
+	type inlineImage struct {
+		contentID   string
+		name        string
+		contentType string
+		content     []byte
+	}
+
+	var images []inlineImage
 	var rendered strings.Builder
 
 	block := ""
@@ -1809,7 +1823,41 @@ func (b *Mailbox) Queue(draft Draft) error {
 			continue
 		}
 
-		parts := strings.Split(html.EscapeString(text), "**")
+		var tags []string
+
+		for _, match := range imagePattern.FindAllStringSubmatch(text, -1) {
+			path := strings.TrimSpace(match[2])
+			rest, inHome := strings.CutPrefix(path, "~/")
+
+			if inHome {
+				home, err := os.UserHomeDir()
+
+				if err != nil {
+					return err
+				}
+
+				path = filepath.Join(home, rest)
+			}
+
+			content, err := os.ReadFile(path)
+
+			if err != nil {
+				return fmt.Errorf("reading the image %s: %w", filepath.Base(path), err)
+			}
+
+			contentType := mime.TypeByExtension(filepath.Ext(path))
+
+			if contentType == "" {
+				contentType = "application/octet-stream"
+			}
+
+			contentID := fmt.Sprintf("image%d.%s", len(images)+1, messageID)
+			images = append(images, inlineImage{contentID: contentID, name: filepath.Base(path), contentType: contentType, content: content})
+			tags = append(tags, `<img src="cid:`+contentID+`" alt="`+html.EscapeString(match[1])+`">`)
+		}
+
+		// A NUL marks each image so the bold markers can't split its tag.
+		parts := strings.Split(html.EscapeString(imagePattern.ReplaceAllString(text, "\x00")), "**")
 
 		var inline strings.Builder
 
@@ -1830,12 +1878,18 @@ func (b *Mailbox) Queue(draft Draft) error {
 			inline.WriteString(part)
 		}
 
+		withImages := inline.String()
+
+		for _, tag := range tags {
+			withImages = strings.Replace(withImages, "\x00", tag, 1)
+		}
+
 		if kind == "ul" {
-			rendered.WriteString("<li>" + inline.String() + "</li>")
+			rendered.WriteString("<li>" + withImages + "</li>")
 			continue
 		}
 
-		rendered.WriteString(inline.String())
+		rendered.WriteString(withImages)
 	}
 
 	if block != "" {
@@ -1844,7 +1898,7 @@ func (b *Mailbox) Queue(draft Draft) error {
 
 	rendered.WriteString(strings.Repeat("</blockquote>", depth))
 
-	plainText := draft.Body
+	plainText := imagePattern.ReplaceAllString(draft.Body, "$1")
 	htmlText := rendered.String()
 
 	if account.Signature != "" {
@@ -1858,24 +1912,124 @@ func (b *Mailbox) Queue(draft Draft) error {
 		htmlText += string(signature)
 	}
 
+	if draft.Quote && ok {
+		loaded, err := b.Load(original.ID)
+
+		if err != nil {
+			return fmt.Errorf("reading the email you're replying to: %w", err)
+		}
+
+		attribution := "On " + loaded.Date.Format("Mon 2 Jan 2006 at 15:04") + ", " + loaded.From.Short() + " wrote:"
+
+		var quotedText strings.Builder
+
+		for _, line := range strings.Split(loaded.Text, "\n") {
+			quotedText.WriteString("\n> " + line)
+		}
+
+		plainText += "\n\n" + attribution + quotedText.String()
+
+		quotedHTML := `<div style="white-space:pre-wrap">` + html.EscapeString(loaded.Text) + `</div>`
+
+		if loaded.HTML != "" {
+			document, err := html.Parse(strings.NewReader(loaded.HTML))
+
+			if err != nil {
+				return fmt.Errorf("reading the email you're replying to: %w", err)
+			}
+
+			// Gmail and Outlook drop data: images, so each becomes an inline part.
+			for node := range document.Descendants() {
+				if node.Type != html.ElementNode {
+					continue
+				}
+
+				for a, attribute := range node.Attr {
+					isImage := (node.Data == "img" && attribute.Key == "src") || attribute.Key == "background"
+					rest, isData := strings.CutPrefix(attribute.Val, "data:")
+					meta, encodedImage, _ := strings.Cut(rest, ",")
+					contentType, isBase64 := strings.CutSuffix(meta, ";base64")
+
+					if !isImage || !isData || !isBase64 {
+						continue
+					}
+
+					content, err := base64.StdEncoding.DecodeString(encodedImage)
+
+					if err != nil {
+						continue
+					}
+
+					contentID := fmt.Sprintf("image%d.%s", len(images)+1, messageID)
+					images = append(images, inlineImage{contentID: contentID, name: fmt.Sprintf("image%d", len(images)+1), contentType: contentType, content: content})
+					node.Attr[a].Val = "cid:" + contentID
+				}
+			}
+
+			var quoted strings.Builder
+
+			for node := range document.Descendants() {
+				switch {
+				case node.Type == html.ElementNode && node.Data == "style" && node.Parent.Data == "head":
+					err = html.Render(&quoted, node)
+
+				case node.Type == html.ElementNode && node.Data == "body":
+					for child := range node.ChildNodes() {
+						err = errors.Join(err, html.Render(&quoted, child))
+					}
+				}
+
+				if err != nil {
+					return fmt.Errorf("quoting the email you're replying to: %w", err)
+				}
+			}
+
+			quotedHTML = quoted.String()
+		}
+
+		htmlText += "<p>" + html.EscapeString(attribution) + `</p><blockquote style="margin:0 0 0 0.8ex;border-left:1px solid #ccc;padding-left:1ex">` + quotedHTML + "</blockquote>"
+	}
+
 	var encoded bytes.Buffer
 
-	writer, err := mail.CreateWriter(&encoded, header)
+	header.SetContentType("multipart/mixed", nil)
+
+	writer, err := mimemessage.CreateWriter(&encoded, header.Header)
 
 	if err != nil {
 		return err
 	}
 
-	alternatives, err := writer.CreateInline()
+	textWriter := writer
+
+	if len(images) > 0 {
+		var relatedHeader mimemessage.Header
+
+		relatedHeader.SetContentType("multipart/related", nil)
+
+		textWriter, err = writer.CreatePart(relatedHeader)
+
+		if err != nil {
+			return err
+		}
+	}
+
+	var alternativesHeader mimemessage.Header
+
+	alternativesHeader.SetContentType("multipart/alternative", nil)
+
+	alternatives, err := textWriter.CreatePart(alternativesHeader)
 
 	if err != nil {
 		return err
 	}
 
 	for _, part := range []struct{ contentType, content string }{{"text/plain", plainText}, {"text/html", htmlText}} {
-		var partHeader mail.InlineHeader
+		var partHeader mimemessage.Header
 
 		partHeader.SetContentType(part.contentType, map[string]string{"charset": "utf-8"})
+		partHeader.Set("Content-Disposition", "inline")
+		partHeader.Set("Content-Transfer-Encoding", "quoted-printable")
 
 		partWriter, err := alternatives.CreatePart(partHeader)
 
@@ -1902,6 +2056,46 @@ func (b *Mailbox) Queue(draft Draft) error {
 		return err
 	}
 
+	storedHTML := htmlText
+
+	for _, image := range images {
+		var imageHeader mimemessage.Header
+
+		imageHeader.SetContentType(image.contentType, nil)
+		imageHeader.SetContentDisposition("inline", map[string]string{"filename": image.name})
+		imageHeader.Set("Content-Id", "<"+image.contentID+">")
+		imageHeader.Set("Content-Transfer-Encoding", "base64")
+
+		imageWriter, err := textWriter.CreatePart(imageHeader)
+
+		if err != nil {
+			return err
+		}
+
+		_, err = imageWriter.Write(image.content)
+
+		if err != nil {
+			return err
+		}
+
+		err = imageWriter.Close()
+
+		if err != nil {
+			return err
+		}
+
+		// The Outbox copy shows in the viewer, which can't resolve cid: addresses.
+		storedHTML = strings.ReplaceAll(storedHTML, "cid:"+image.contentID, "data:"+image.contentType+";base64,"+base64.StdEncoding.EncodeToString(image.content))
+	}
+
+	if len(images) > 0 {
+		err = textWriter.Close()
+
+		if err != nil {
+			return err
+		}
+	}
+
 	var attachments []Attachment
 
 	for _, path := range draft.Attach {
@@ -1923,8 +2117,9 @@ func (b *Mailbox) Queue(draft Draft) error {
 
 		attachmentHeader.Set("Content-Type", contentType)
 		attachmentHeader.SetFilename(filepath.Base(path))
+		attachmentHeader.Set("Content-Transfer-Encoding", "base64")
 
-		attachmentWriter, err := writer.CreateAttachment(attachmentHeader)
+		attachmentWriter, err := writer.CreatePart(attachmentHeader.Header)
 
 		if err != nil {
 			return err
@@ -1956,7 +2151,7 @@ func (b *Mailbox) Queue(draft Draft) error {
 		Account:      account.Name,
 		Folder:       Outbox,
 		ServerFolder: Outbox,
-		From:         Address{Email: account.Email},
+		From:         Address{Name: account.DisplayName, Email: account.Email},
 		Subject:      draft.Subject,
 		Date:         now,
 		MessageID:    messageID,
@@ -1976,7 +2171,7 @@ func (b *Mailbox) Queue(draft Draft) error {
 		return err
 	}
 
-	stored := storedBody{HTML: htmlText, Attachments: attachments, Raw: encoded.Bytes(), BccHeader: bytes.TrimSuffix(bccHeader.Bytes(), []byte("\r\n")), Draft: draft}
+	stored := storedBody{HTML: storedHTML, Attachments: attachments, Raw: encoded.Bytes(), BccHeader: bytes.TrimSuffix(bccHeader.Bytes(), []byte("\r\n")), Draft: draft}
 
 	for _, recipient := range recipients {
 		message.To = append(message.To, Address{Name: recipient.Name, Email: recipient.Address})
