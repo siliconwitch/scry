@@ -53,11 +53,37 @@ type folderRow struct {
 	folder  string
 }
 
-type syncDoneMsg struct{ err error }
+type syncDoneMsg struct {
+	account string
+	err     error
+}
 
 type syncProgressMsg struct{}
 
-type sendDoneMsg struct{ err error }
+type retryMsg struct {
+	account    string
+	generation int
+}
+
+type heartbeatMsg struct{ scheduled time.Time }
+
+type watchDoneMsg struct {
+	account    string
+	generation int
+	err        error
+}
+
+type logTickMsg struct{ generation int }
+
+type queuedMsg struct {
+	account string
+	err     error
+}
+
+type unqueuedMsg struct {
+	draft mailbox.Draft
+	err   error
+}
 
 type savedMsg struct{ err error }
 
@@ -79,6 +105,21 @@ type editorDoneMsg struct {
 const sendDelay = 5
 
 const folderPaneWidth = 24
+
+const heartbeatInterval = 15 * time.Second
+
+type accountSync struct {
+	running         bool
+	queued          bool
+	failed          bool
+	cancel          context.CancelFunc
+	startedAt       time.Time
+	retryDelay      time.Duration
+	retryGeneration int
+	watching        bool
+	watchGeneration int
+	stopWatch       context.CancelFunc
+}
 
 type adaptiveColor struct {
 	Light string
@@ -102,7 +143,7 @@ var (
 	boldStyle = lipgloss.NewStyle().Bold(true)
 )
 
-var clickableKeys = []string{"A", "M", "!", "D", "r", "R", "n", "ctrl+r", "L", "q", "/", "e", "s", "h", "x", "u", "w", "y", "enter", "esc"}
+var clickableKeys = []string{"A", "M", "!", "D", "r", "R", "n", "ctrl+r", "L", "q", "/", "e", "s", "h", "x", "u", "w", "y", "enter", "esc", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
 
 type Model struct {
 	options Options
@@ -126,9 +167,7 @@ type Model struct {
 
 	shownID string
 
-	networkActive int
-	syncFailed    bool
-	sendFailed    bool
+	syncs map[string]*accountSync
 
 	draft              *mailbox.Draft
 	draftVisible       bool
@@ -142,11 +181,14 @@ type Model struct {
 	popup           popup
 	moveTargets     []string
 	moveIndex       int
-	logLines        []string
+	logLines        []synclog.Entry
 	logOffset       int
+	logFilter       string
+	logGeneration   int
 	pendingCompose  bool
 	pendingReplyID  string
 	pendingReplyAll bool
+	pendingUnqueue  string
 
 	notice           string
 	noticeGeneration int
@@ -164,14 +206,11 @@ func New(options Options) *Model {
 		search:   search,
 		focus:    listPane,
 		notice:   options.StartNotice,
+		syncs:    map[string]*accountSync{},
 	}
 
-	m.folderRows = append(m.folderRows, folderRow{folder: mailbox.Inbox})
-
 	for _, account := range m.accounts {
-		for _, folder := range account.Folders {
-			m.folderRows = append(m.folderRows, folderRow{account: account.Name, folder: folder})
-		}
+		m.syncs[account.Name] = &accountSync{}
 	}
 
 	m.reload()
@@ -180,7 +219,13 @@ func New(options Options) *Model {
 }
 
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(tea.RequestBackgroundColor, m.startSync(), m.showSelected())
+	cmds := []tea.Cmd{tea.RequestBackgroundColor, m.showSelected(), heartbeat()}
+
+	for _, account := range m.accounts {
+		cmds = append(cmds, m.requestSync(account.Name))
+	}
+
+	return tea.Batch(cmds...)
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -320,7 +365,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case syncProgressMsg:
-		if m.networkActive == 0 {
+		if !m.syncing() {
 			return m, nil
 		}
 
@@ -329,27 +374,136 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.showSelected(), tea.Tick(2*time.Second, func(time.Time) tea.Msg { return syncProgressMsg{} }))
 
 	case syncDoneMsg:
-		m.networkActive--
-		m.syncFailed = msg.err != nil
+		state := m.syncs[msg.account]
+		state.running = false
+		state.failed = msg.err != nil
 
 		if msg.err != nil {
 			for _, line := range strings.Split(msg.err.Error(), "\n") {
-				m.options.Log.Write("Sync failed: %s", line)
+				m.options.Log.Write(msg.account, "Sync failed: %s", line)
 			}
 		} else {
-			m.options.Log.Write("Sync finished")
+			m.options.Log.Write(msg.account, "Sync finished")
+			state.retryDelay = 0
 		}
 
 		m.reload()
 
-		return m, m.showSelected()
+		cmds := []tea.Cmd{m.showSelected()}
+
+		unlocked := m.options.Mail.Unlocked(msg.account)
+
+		if !state.watching && unlocked {
+			cmds = append(cmds, m.startWatch(msg.account))
+		}
+
+		switch {
+		case state.queued:
+			state.queued = false
+			m.options.Log.Write(msg.account, "Starting the queued sync")
+			cmds = append(cmds, m.requestSync(msg.account))
+
+		case msg.err != nil && !unlocked:
+			m.options.Log.Write(msg.account, "Not retrying, because the account isn't unlocked. Press Ctrl+R to try again")
+
+		case msg.err != nil:
+			state.retryDelay = min(5*time.Minute, max(10*time.Second, 2*state.retryDelay))
+			state.retryGeneration++
+
+			account := msg.account
+			generation := state.retryGeneration
+
+			m.options.Log.Write(account, "Retrying in %s", state.retryDelay)
+			cmds = append(cmds, tea.Tick(state.retryDelay, func(time.Time) tea.Msg { return retryMsg{account: account, generation: generation} }))
+		}
+
+		return m, tea.Batch(cmds...)
+
+	case retryMsg:
+		if msg.generation != m.syncs[msg.account].retryGeneration {
+			return m, nil
+		}
+
+		return m, m.requestSync(msg.account)
+
+	case watchDoneMsg:
+		state := m.syncs[msg.account]
+
+		if msg.generation != state.watchGeneration {
+			return m, nil
+		}
+
+		state.watching = false
+
+		if msg.err != nil {
+			m.options.Log.Write(msg.account, "Inbox watch stopped: %s. It restarts after the next sync", msg.err)
+			return m, nil
+		}
+
+		return m, tea.Batch(m.startWatch(msg.account), m.requestSync(msg.account))
+
+	case heartbeatMsg:
+		now := time.Now().Round(0)
+		asleep := now.Sub(msg.scheduled) - heartbeatInterval
+		woke := asleep > 30*time.Second
+
+		cmds := []tea.Cmd{heartbeat()}
+
+		if woke {
+			m.options.Log.Write("", "Woke after %s asleep, so every account reconnects", asleep.Round(time.Second))
+		}
+
+		for _, account := range m.accounts {
+			state := m.syncs[account.Name]
+
+			if woke && state.stopWatch != nil {
+				state.stopWatch()
+				state.watching = false
+				state.watchGeneration++
+			}
+
+			switch {
+			case !m.options.Mail.Unlocked(account.Name):
+
+			case woke && state.running:
+				state.cancel()
+				state.queued = true
+
+			case woke:
+				cmds = append(cmds, m.requestSync(account.Name))
+
+			case !state.running && now.Sub(state.startedAt) >= 10*time.Minute:
+				m.options.Log.Write(account.Name, "Ten minutes since the last sync")
+				cmds = append(cmds, m.requestSync(account.Name))
+			}
+		}
+
+		return m, tea.Batch(cmds...)
+
+	case logTickMsg:
+		if msg.generation != m.logGeneration || m.popup != logPopup {
+			return m, nil
+		}
+
+		rows := m.logRows()
+		following := m.logOffset >= len(m.logEntries())-rows
+
+		m.logLines = m.options.Log.Entries()
+
+		if following {
+			m.logOffset = max(0, len(m.logEntries())-rows)
+		}
+
+		generation := msg.generation
+
+		return m, tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg { return logTickMsg{generation: generation} })
 
 	case savedMsg:
 		if msg.err == nil {
 			return m, nil
 		}
 
-		m.options.Log.Write("Save failed: %s", msg.err)
+		m.options.Log.Write("", "Save failed: %s", msg.err)
 
 		return m, m.setNotice(msg.err.Error())
 
@@ -400,7 +554,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.sending = false
 		m.delivering = true
-		m.networkActive++
 
 		draft := *m.draft
 		draft.Attach = nil
@@ -411,27 +564,38 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		mail := m.options.Mail
 
-		return m, func() tea.Msg { return sendDoneMsg{err: mail.Send(draft)} }
+		return m, func() tea.Msg { return queuedMsg{account: draft.Account, err: mail.Queue(draft)} }
 
-	case sendDoneMsg:
+	case queuedMsg:
 		m.delivering = false
-		m.networkActive--
-		m.sendFailed = msg.err != nil
 
 		if msg.err != nil {
-			m.options.Log.Write("Sending from %s failed: %v", m.draft.Account, msg.err)
+			m.options.Log.Write(msg.account, "Adding an email to the Outbox failed: %s", msg.err)
 			m.draftError = "Couldn't send: " + msg.err.Error()
 			m.draftVisible = true
 			return m, nil
 		}
 
-		m.options.Log.Write("Sent a message from %s", m.draft.Account)
-		account := m.draft.Account
+		m.options.Log.Write(msg.account, "Added an email to the Outbox")
 		m.draft = nil
 		m.draftVisible = false
 		m.reload()
 
-		return m, m.setNotice("Sent from " + account)
+		return m, tea.Batch(m.setNotice("Sending from "+msg.account), m.requestSync(msg.account))
+
+	case unqueuedMsg:
+		if msg.err != nil {
+			return m, m.setNotice("Can't return it to the draft: " + msg.err.Error())
+		}
+
+		m.options.Log.Write(msg.draft.Account, "Returned an email from the Outbox to the draft")
+		m.draft = &msg.draft
+		m.draftVisible = true
+		m.draftError = ""
+		m.missingAttachments = nil
+		m.reload()
+
+		return m, nil
 
 	case noticeExpiredMsg:
 		if msg.generation == m.noticeGeneration {
@@ -549,6 +713,12 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 			m.draftVisible = false
 			m.draftError = ""
 
+			if m.pendingUnqueue != "" {
+				id := m.pendingUnqueue
+				m.pendingUnqueue = ""
+				return m, m.unqueue(id)
+			}
+
 			if m.pendingCompose {
 				return m, m.startCompose(m.pendingReplyID, m.pendingReplyAll)
 			}
@@ -557,6 +727,7 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 
 		case "n", "esc", "q":
 			m.popup = noPopup
+			m.pendingUnqueue = ""
 		}
 
 		return m, nil
@@ -566,10 +737,25 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 
 		switch key {
 		case "j", "down":
-			m.logOffset = min(m.logOffset+1, max(0, len(m.logLines)-visibleLines))
+			m.logOffset = min(m.logOffset+1, max(0, len(m.logEntries())-visibleLines))
 
 		case "k", "up":
 			m.logOffset = max(m.logOffset-1, 0)
+
+		case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+			index := int(key[0] - '1')
+
+			if index >= len(m.accounts) {
+				return m, nil
+			}
+
+			if m.logFilter == m.accounts[index].Name {
+				m.logFilter = ""
+			} else {
+				m.logFilter = m.accounts[index].Name
+			}
+
+			m.logOffset = max(0, len(m.logEntries())-visibleLines)
 
 		case "esc", "q", "L":
 			m.popup = noPopup
@@ -598,17 +784,35 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case "ctrl+r":
-		if m.networkActive > 0 {
+		var cmds []tea.Cmd
+
+		for _, account := range m.accounts {
+			cmds = append(cmds, m.requestSync(account.Name))
+		}
+
+		return m, tea.Batch(cmds...)
+
+	case "1", "2", "3", "4", "5", "6", "7", "8", "9":
+		index := int(key[0] - '1')
+
+		if index >= len(m.accounts) {
 			return m, nil
 		}
 
-		return m, m.startSync()
+		m.draftVisible = false
+		m.focus = listPane
+
+		return m, m.selectFolder(slices.Index(m.folderRows, folderRow{account: m.accounts[index].Name, folder: mailbox.Inbox}))
 
 	case "L":
-		m.logLines = m.options.Log.Lines()
-		m.logOffset = max(0, len(m.logLines)-m.logRows())
+		m.logLines = m.options.Log.Entries()
+		m.logOffset = max(0, len(m.logEntries())-m.logRows())
 		m.popup = logPopup
-		return m, nil
+		m.logGeneration++
+
+		generation := m.logGeneration
+
+		return m, tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg { return logTickMsg{generation: generation} })
 
 	case "w":
 		if m.draft != nil {
@@ -661,6 +865,7 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 
 		case "x":
 			m.pendingCompose = false
+			m.pendingUnqueue = ""
 			m.popup = discardPopup
 		}
 
@@ -708,7 +913,18 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 		return m, m.moveSelected(mailbox.Spam)
 
 	case "D":
-		return m, m.moveSelected(mailbox.Trash)
+		if !hasSelection || selected.Folder != mailbox.Outbox {
+			return m, m.moveSelected(mailbox.Trash)
+		}
+
+		if m.draft != nil {
+			m.pendingCompose = false
+			m.pendingUnqueue = selected.ID
+			m.popup = discardPopup
+			return m, nil
+		}
+
+		return m, m.unqueue(selected.ID)
 
 	case "M":
 		if !hasSelection {
@@ -764,6 +980,30 @@ func (m *Model) selectFolder(index int) tea.Cmd {
 
 func (m *Model) reload() {
 	previous, _ := m.selected()
+
+	selectedRow := folderRow{folder: mailbox.Inbox}
+
+	if m.folderIndex < len(m.folderRows) {
+		selectedRow = m.folderRows[m.folderIndex]
+	}
+
+	m.folderRows = []folderRow{{folder: mailbox.Inbox}}
+
+	for _, account := range m.accounts {
+		for _, folder := range account.Folders {
+			m.folderRows = append(m.folderRows, folderRow{account: account.Name, folder: folder})
+
+			if folder == mailbox.Inbox && len(m.options.Mail.Folder(account.Name, mailbox.Outbox)) > 0 {
+				m.folderRows = append(m.folderRows, folderRow{account: account.Name, folder: mailbox.Outbox})
+			}
+		}
+	}
+
+	m.folderIndex = slices.Index(m.folderRows, selectedRow)
+
+	if m.folderIndex < 0 {
+		m.folderIndex = slices.Index(m.folderRows, folderRow{account: selectedRow.account, folder: mailbox.Inbox})
+	}
 
 	query := strings.TrimSpace(m.search.Value())
 
@@ -830,7 +1070,7 @@ func (m *Model) showSelected() tea.Cmd {
 	mail.MarkRead(message.ID)
 	m.reload()
 
-	return tea.Batch(load, func() tea.Msg { return savedMsg{err: mail.Save()} })
+	return tea.Batch(load, func() tea.Msg { return savedMsg{err: mail.Save()} }, m.requestSync(message.Account))
 }
 
 func (m *Model) moveSelected(folder string) tea.Cmd {
@@ -850,17 +1090,28 @@ func (m *Model) moveSelected(folder string) tea.Cmd {
 		return m.setNotice(err.Error())
 	}
 
-	m.options.Log.Write("Moved a message to %s in %s", folder, message.Account)
+	m.options.Log.Write(message.Account, "Moved an email to %s", folder)
 
 	m.reload()
 
 	mail := m.options.Mail
 
-	return tea.Batch(m.showSelected(), m.setNotice("Moved to "+folder), func() tea.Msg { return savedMsg{err: mail.Save()} })
+	return tea.Batch(m.showSelected(), m.setNotice("Moved to "+folder), func() tea.Msg { return savedMsg{err: mail.Save()} }, m.requestSync(message.Account))
+}
+
+func (m *Model) unqueue(id string) tea.Cmd {
+	mail := m.options.Mail
+
+	return func() tea.Msg {
+		draft, err := mail.Unqueue(id)
+
+		return unqueuedMsg{draft: draft, err: err}
+	}
 }
 
 func (m *Model) requestCompose(replyID string, replyAll bool) tea.Cmd {
 	if m.draft != nil {
+		m.pendingUnqueue = ""
 		m.pendingCompose = true
 		m.pendingReplyID = replyID
 		m.pendingReplyAll = replyAll
@@ -981,21 +1232,104 @@ func (m *Model) openEditor() tea.Cmd {
 	return tea.ExecProcess(command, func(err error) tea.Msg { return editorDoneMsg{path: path, err: err} })
 }
 
-func (m *Model) startSync() tea.Cmd {
-	m.networkActive++
-	m.options.Log.Write("Sync started")
+func (m *Model) requestSync(account string) tea.Cmd {
+	state := m.syncs[account]
+
+	if state.running {
+		if !state.queued {
+			m.options.Log.Write(account, "Sync queued behind the running one")
+		}
+
+		state.queued = true
+
+		return nil
+	}
+
+	var progressTick tea.Cmd
+
+	if !m.syncing() {
+		progressTick = tea.Tick(2*time.Second, func(time.Time) tea.Msg { return syncProgressMsg{} })
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+
+	state.running = true
+	state.cancel = cancel
+	state.startedAt = time.Now().Round(0)
+	state.retryGeneration++
+
+	m.options.Log.Write(account, "Sync started")
 
 	mail := m.options.Mail
 	log := m.options.Log
 
 	sync := func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
 
-		return syncDoneMsg{err: mail.Sync(ctx, log.Write)}
+		err := mail.Sync(ctx, account, func(format string, arguments ...any) { log.Write(account, format, arguments...) })
+
+		return syncDoneMsg{account: account, err: err}
 	}
 
-	return tea.Batch(sync, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return syncProgressMsg{} }))
+	return tea.Batch(sync, progressTick)
+}
+
+func (m *Model) startWatch(account string) tea.Cmd {
+	state := m.syncs[account]
+
+	if state.stopWatch != nil {
+		state.stopWatch()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	state.watching = true
+	state.watchGeneration++
+	state.stopWatch = cancel
+
+	generation := state.watchGeneration
+	mail := m.options.Mail
+	log := m.options.Log
+
+	return func() tea.Msg {
+		defer cancel()
+
+		err := mail.WatchInbox(ctx, account, func(format string, arguments ...any) { log.Write(account, format, arguments...) })
+
+		return watchDoneMsg{account: account, generation: generation, err: err}
+	}
+}
+
+func (m *Model) syncing() bool {
+	for _, state := range m.syncs {
+		if state.running {
+			return true
+		}
+	}
+
+	return false
+}
+
+func heartbeat() tea.Cmd {
+	scheduled := time.Now().Round(0)
+
+	return tea.Tick(heartbeatInterval, func(time.Time) tea.Msg { return heartbeatMsg{scheduled: scheduled} })
+}
+
+func (m *Model) logEntries() []synclog.Entry {
+	if m.logFilter == "" {
+		return m.logLines
+	}
+
+	var filtered []synclog.Entry
+
+	for _, entry := range m.logLines {
+		if entry.Account == m.logFilter {
+			filtered = append(filtered, entry)
+		}
+	}
+
+	return filtered
 }
 
 func (m *Model) sendTick() tea.Cmd {
@@ -1047,20 +1381,31 @@ func (m *Model) View() tea.View {
 		return view
 	}
 
+	failed := false
+	done, total := 0, 0
+
+	for name, state := range m.syncs {
+		failed = failed || state.failed
+
+		if state.running {
+			accountDone, accountTotal := m.options.Mail.SyncProgress(name)
+			done += accountDone
+			total += accountTotal
+		}
+	}
+
 	statusColor := accentColor
 	switch {
-	case m.networkActive > 0:
+	case m.syncing():
 		statusColor = yellowColor
 
-	case m.syncFailed || m.sendFailed:
+	case failed:
 		statusColor = redColor
 	}
 
 	logo := " " + m.zones.Mark("key:L", m.style(statusColor).Render("◉")) + m.style(accentColor).Bold(true).Render(" scry ")
 
-	done, total := m.options.Mail.SyncProgress()
-
-	if m.networkActive > 0 && total > 0 {
+	if m.syncing() && total > 0 {
 		logo += m.style(yellowColor).Render(fmt.Sprintf("%d%% ", done*100/total))
 	}
 
@@ -1372,7 +1717,11 @@ func (m *Model) View() tea.View {
 
 	case discardPopup:
 		question := "Discard this draft?"
-		if m.pendingCompose {
+		switch {
+		case m.pendingUnqueue != "":
+			question = "Returning this email to the draft discards the current draft."
+
+		case m.pendingCompose:
 			question = "Starting a new email discards the current draft."
 		}
 
@@ -1383,17 +1732,40 @@ func (m *Model) View() tea.View {
 	case logPopup:
 		boxWidth := min(m.width-8, 110)
 
+		title := boldStyle.Render("Sync log")
+
+		if m.logFilter != "" {
+			title += m.style(mutedColor).Render(" · ") + m.style(m.accountColor(m.logFilter)).Bold(true).Render(m.logFilter)
+		}
+
 		lines := []string{
-			boldStyle.Render("Sync log") + m.style(mutedColor).Render("  "+m.options.LogDirectory),
+			title + m.style(mutedColor).Render("  "+m.options.LogDirectory),
 			m.style(mutedColor).Render("Viewer  ") + m.options.Viewer.URL(),
 			"",
 		}
 
-		if len(m.logLines) == 0 {
+		entries := m.logEntries()
+
+		if len(entries) == 0 {
 			lines = append(lines, m.style(mutedColor).Render("Nothing logged yet."))
 		}
 
-		for _, line := range m.logLines[m.logOffset:min(len(m.logLines), m.logOffset+m.logRows())] {
+		accountWidth := 0
+		for _, account := range m.accounts {
+			accountWidth = max(accountWidth, lipgloss.Width(account.Name))
+		}
+
+		start := min(m.logOffset, len(entries))
+
+		for _, entry := range entries[start:min(len(entries), start+m.logRows())] {
+			text := entry.Text
+
+			if entry.Account != "" {
+				text = m.style(m.accountColor(entry.Account)).Render(text)
+			}
+
+			line := m.style(mutedColor).Render(entry.Time) + "  " + fit(m.style(m.accountColor(entry.Account)).Bold(true).Render(entry.Account), accountWidth) + "  " + text
+
 			lines = append(lines, fit(line, boxWidth-4))
 		}
 
@@ -1410,7 +1782,16 @@ func (m *Model) View() tea.View {
 		footerRows = [][]string{{m.button("y", "discard"), m.button("n", "keep")}}
 
 	case m.popup == logPopup:
-		footerRows = [][]string{{m.button("esc", "close")}}
+		var buttons []string
+
+		for i, account := range m.accounts[:min(9, len(m.accounts))] {
+			key := strconv.Itoa(i + 1)
+			nameStyle := m.style(m.accountColor(account.Name)).Bold(account.Name == m.logFilter)
+
+			buttons = append(buttons, m.zones.Mark("key:"+key, m.style(mutedColor).Bold(true).Render(key)+" "+nameStyle.Render(account.Name)))
+		}
+
+		footerRows = [][]string{append(buttons, m.button("esc", "close"))}
 
 	case m.sending:
 		footerRows = [][]string{{m.button("u", "undo send")}}
@@ -1424,9 +1805,17 @@ func (m *Model) View() tea.View {
 		footerRows = [][]string{{m.button("enter", "browse results"), m.button("esc", "clear search")}}
 
 	default:
+		deleteLabel := "delete"
+
+		selected, hasSelection := m.selected()
+
+		if hasSelection && selected.Folder == mailbox.Outbox {
+			deleteLabel = "back to draft"
+		}
+
 		footerRows = [][]string{
 			{
-				m.button("A", "archive"), m.button("M", "move"), m.button("!", "spam"), m.button("D", "delete"),
+				m.button("A", "archive"), m.button("M", "move"), m.button("!", "spam"), m.button("D", deleteLabel),
 				m.button("r", "reply all"), m.button("R", "reply"),
 			},
 			{

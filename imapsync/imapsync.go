@@ -3,13 +3,16 @@ package imapsync
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"io"
 	"mime"
 	"net"
+	"os"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -51,25 +54,107 @@ type Fetched struct {
 }
 
 type Session struct {
-	client *imapclient.Client
-	stop   func() bool
+	client  *imapclient.Client
+	conn    *watchedConn
+	changes chan struct{}
+	stop    func() bool
+}
+
+const stallTimeout = time.Minute
+
+// go-imap sets no read deadline while it waits for a response to start, so a command sent into a dead network would wait forever. It also retries reads after a timeout, so the connection closes on the first one.
+type watchedConn struct {
+	net.Conn
+	mutex    sync.Mutex
+	watching bool
+}
+
+func (c *watchedConn) Read(buffer []byte) (int, error) {
+	c.mutex.Lock()
+
+	if c.watching {
+		c.Conn.SetReadDeadline(time.Now().Add(stallTimeout))
+	}
+
+	c.mutex.Unlock()
+
+	count, err := c.Conn.Read(buffer)
+
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		c.Conn.Close()
+	}
+
+	return count, err
+}
+
+func (c *watchedConn) watch(watching bool) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	c.watching = watching
+
+	deadline := time.Time{}
+	if watching {
+		deadline = time.Now().Add(stallTimeout)
+	}
+
+	c.Conn.SetReadDeadline(deadline)
 }
 
 func Dial(ctx context.Context, address, email, password string) (*Session, error) {
-	options := &imapclient.Options{WordDecoder: &mime.WordDecoder{CharsetReader: charset.Reader}}
+	host, port, err := net.SplitHostPort(address)
 
-	_, port, _ := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+
+	dialer := &net.Dialer{
+		Timeout:         20 * time.Second,
+		KeepAliveConfig: net.KeepAliveConfig{Enable: true, Idle: 30 * time.Second, Interval: 10 * time.Second, Count: 3},
+	}
+
+	raw, err := dialer.DialContext(ctx, "tcp", address)
+
+	if err != nil {
+		return nil, err
+	}
+
+	conn := &watchedConn{Conn: raw}
+	changes := make(chan struct{}, 1)
+
+	notify := func() {
+		select {
+		case changes <- struct{}{}:
+
+		default:
+		}
+	}
+
+	options := &imapclient.Options{
+		WordDecoder: &mime.WordDecoder{CharsetReader: charset.Reader},
+		TLSConfig:   &tls.Config{ServerName: host},
+		UnilateralDataHandler: &imapclient.UnilateralDataHandler{
+			Mailbox: func(*imapclient.UnilateralDataMailbox) { notify() },
+			Expunge: func(uint32) { notify() },
+			Fetch: func(message *imapclient.FetchMessageData) {
+				message.Collect()
+				notify()
+			},
+		},
+	}
+
+	conn.watch(true)
 
 	var client *imapclient.Client
-	var err error
 
 	if port == "993" {
-		client, err = imapclient.DialTLS(address, options)
+		client = imapclient.New(tls.Client(conn, options.TLSConfig), options)
 	} else {
-		client, err = imapclient.DialStartTLS(address, options)
+		client, err = imapclient.NewStartTLS(conn, options)
 	}
 
 	if err != nil {
+		raw.Close()
 		return nil, err
 	}
 
@@ -83,16 +168,22 @@ func Dial(ctx context.Context, address, email, password string) (*Session, error
 		return nil, err
 	}
 
-	return &Session{client: client, stop: stop}, nil
+	conn.watch(false)
+
+	return &Session{client: client, conn: conn, changes: changes, stop: stop}, nil
 }
 
 func (s *Session) Close() {
 	s.stop()
+	s.conn.watch(true)
 	s.client.Logout().Wait()
 	s.client.Close()
 }
 
 func (s *Session) Folders() ([]Folder, error) {
+	s.conn.watch(true)
+	defer s.conn.watch(false)
+
 	listed, err := s.client.List("", "*", nil).Collect()
 
 	if err != nil {
@@ -119,6 +210,9 @@ func (s *Session) Folders() ([]Folder, error) {
 }
 
 func (s *Session) Select(name string) (uidValidity uint32, err error) {
+	s.conn.watch(true)
+	defer s.conn.watch(false)
+
 	selected, err := s.client.Select(name, nil).Wait()
 
 	if err != nil {
@@ -129,6 +223,9 @@ func (s *Session) Select(name string) (uidValidity uint32, err error) {
 }
 
 func (s *Session) Search(since time.Time) ([]uint32, error) {
+	s.conn.watch(true)
+	defer s.conn.watch(false)
+
 	found, err := s.client.UIDSearch(&imap.SearchCriteria{Since: since}, nil).Wait()
 
 	if err != nil {
@@ -144,6 +241,9 @@ func (s *Session) Search(since time.Time) ([]uint32, error) {
 }
 
 func (s *Session) MarkSeen(uids []uint32) error {
+	s.conn.watch(true)
+	defer s.conn.watch(false)
+
 	for batch := range slices.Chunk(uids, 500) {
 		err := s.client.Store(uidSet(batch), &imap.StoreFlags{Op: imap.StoreFlagsAdd, Silent: true, Flags: []imap.Flag{imap.FlagSeen}}, nil).Close()
 
@@ -156,6 +256,9 @@ func (s *Session) MarkSeen(uids []uint32) error {
 }
 
 func (s *Session) Seen(uids []uint32) (map[uint32]bool, error) {
+	s.conn.watch(true)
+	defer s.conn.watch(false)
+
 	seen := map[uint32]bool{}
 
 	for batch := range slices.Chunk(uids, 500) {
@@ -177,6 +280,9 @@ func (s *Session) Move(uids []uint32, destination string) (map[uint32]uint32, er
 	if !s.client.Caps().Has(imap.CapUIDPlus) {
 		return nil, errors.New("the server doesn't support UIDPLUS, which moving needs")
 	}
+
+	s.conn.watch(true)
+	defer s.conn.watch(false)
 
 	moved := map[uint32]uint32{}
 
@@ -209,11 +315,69 @@ func (s *Session) Move(uids []uint32, destination string) (map[uint32]uint32, er
 	return moved, nil
 }
 
+func (s *Session) HasMessageID(messageID string) (bool, error) {
+	s.conn.watch(true)
+	defer s.conn.watch(false)
+
+	found, err := s.client.UIDSearch(&imap.SearchCriteria{Header: []imap.SearchCriteriaHeaderField{{Key: "Message-ID", Value: messageID}}}, nil).Wait()
+
+	if err != nil {
+		return false, err
+	}
+
+	return len(found.AllUIDs()) > 0, nil
+}
+
+func (s *Session) Idle(ctx context.Context, wait time.Duration) (changed bool, err error) {
+	if !s.client.Caps().Has(imap.CapIdle) {
+		return false, errors.New("the server doesn't support IDLE")
+	}
+
+	s.conn.watch(true)
+	idle, err := s.client.Idle()
+	s.conn.watch(false)
+
+	if err != nil {
+		return false, err
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-s.changes:
+		changed = true
+
+	case <-timer.C:
+
+	case <-ctx.Done():
+
+	case <-s.client.Closed():
+	}
+
+	s.conn.watch(true)
+	defer s.conn.watch(false)
+
+	err = idle.Close()
+
+	if err == nil {
+		err = idle.Wait()
+	}
+
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+
+	return changed, err
+}
+
 func (s *Session) Fetch(uids []uint32, deliver func([]Fetched) error) error {
 	sizes := map[uint32]int64{}
 
 	for batch := range slices.Chunk(uids, 500) {
+		s.conn.watch(true)
 		messages, err := s.client.Fetch(uidSet(batch), &imap.FetchOptions{UID: true, RFC822Size: true}).Collect()
+		s.conn.watch(false)
 
 		if err != nil {
 			return err
@@ -246,7 +410,9 @@ func (s *Session) Fetch(uids []uint32, deliver func([]Fetched) error) error {
 	section := &imap.FetchItemBodySection{Peek: true}
 
 	for _, batch := range batches {
+		s.conn.watch(true)
 		messages, err := s.client.Fetch(uidSet(batch), &imap.FetchOptions{UID: true, Flags: true, InternalDate: true, BodySection: []*imap.FetchItemBodySection{section}}).Collect()
+		s.conn.watch(false)
 
 		if err != nil {
 			return err

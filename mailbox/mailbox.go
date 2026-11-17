@@ -40,6 +40,7 @@ const (
 	Archive = "Archive"
 	Spam    = "Spam"
 	Trash   = "Trash"
+	Outbox  = "Outbox"
 )
 
 var ErrAlreadyThere = errors.New("already in that folder")
@@ -90,13 +91,14 @@ type Message struct {
 }
 
 type Account struct {
-	Name            string
-	Email           string
-	IMAP            string
-	SMTP            string
-	Signature       string
-	PasswordCommand string
-	Folders         []string
+	Name                  string
+	Email                 string
+	IMAP                  string
+	SMTP                  string
+	Signature             string
+	PasswordCommand       string
+	Folders               []string
+	HideFromCombinedInbox bool
 }
 
 type Draft struct {
@@ -117,8 +119,13 @@ type Mailbox struct {
 	historyDays     int
 	opened          map[string]*openedAccount
 	pendingSeen     map[string]bool
-	syncDone        int
-	syncTotal       int
+	progress        map[string]syncCount
+	sending         map[string]bool
+}
+
+type syncCount struct {
+	done  int
+	total int
 }
 
 type openedAccount struct {
@@ -142,6 +149,9 @@ type accountIndex struct {
 type storedBody struct {
 	HTML        string
 	Attachments []Attachment
+	Raw         []byte
+	Recipients  []string
+	Draft       Draft
 }
 
 func New(accounts []Account, mirrorDirectory string, historyDays int) *Mailbox {
@@ -158,6 +168,8 @@ func New(accounts []Account, mirrorDirectory string, historyDays int) *Mailbox {
 		historyDays:     historyDays,
 		opened:          map[string]*openedAccount{},
 		pendingSeen:     map[string]bool{},
+		progress:        map[string]syncCount{},
+		sending:         map[string]bool{},
 	}
 }
 
@@ -188,7 +200,7 @@ func (b *Mailbox) Folder(account, folder string) []Message {
 	var found []Message
 
 	for _, message := range b.messages {
-		if message.Folder != folder || (account != "" && message.Account != account) {
+		if message.Folder != folder || !b.viewIncludes(account, message) {
 			continue
 		}
 
@@ -260,12 +272,22 @@ func (b *Mailbox) Unread(account, folder string) int {
 	count := 0
 
 	for _, message := range b.messages {
-		if message.Unread && message.Folder == folder && (account == "" || message.Account == account) {
+		if message.Unread && message.Folder == folder && b.viewIncludes(account, message) {
 			count++
 		}
 	}
 
 	return count
+}
+
+func (b *Mailbox) viewIncludes(account string, message Message) bool {
+	if account != "" {
+		return message.Account == account
+	}
+
+	return !slices.ContainsFunc(b.accounts, func(candidate Account) bool {
+		return candidate.Name == message.Account && candidate.HideFromCombinedInbox
+	})
 }
 
 func (b *Mailbox) Move(id, folder string) error {
@@ -282,6 +304,10 @@ func (b *Mailbox) Move(id, folder string) error {
 
 	if message.Folder == folder {
 		return ErrAlreadyThere
+	}
+
+	if message.Folder == Outbox {
+		return errors.New("an email in the Outbox can't move until it is sent")
 	}
 
 	accountIndex := slices.IndexFunc(b.accounts, func(a Account) bool { return a.Name == message.Account })
@@ -335,14 +361,589 @@ func (b *Mailbox) Save() error {
 	return errors.Join(failures...)
 }
 
-func (b *Mailbox) SyncProgress() (done, total int) {
+func (b *Mailbox) Unlocked(account string) bool {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
-	return b.syncDone, b.syncTotal
+	return b.opened[account] != nil
 }
 
-func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments ...any)) error {
+func (b *Mailbox) SyncProgress(account string) (done, total int) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	count := b.progress[account]
+
+	return count.done, count.total
+}
+
+func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(format string, arguments ...any)) error {
+	account, ok := b.Account(accountName)
+
+	if !ok {
+		return fmt.Errorf("no account called %s", accountName)
+	}
+
+	b.mutex.Lock()
+	b.progress[account.Name] = syncCount{}
+	opened := b.opened[account.Name]
+	b.mutex.Unlock()
+
+	if opened == nil {
+		words := strings.Fields(account.PasswordCommand)
+
+		if len(words) == 0 {
+			return errors.New("the config has no password-cmd")
+		}
+
+		report("Running password-cmd")
+
+		output, err := exec.CommandContext(ctx, words[0], words[1:]...).Output()
+
+		if err != nil {
+			return errors.New("couldn't get the password. Unlock your password store and press Ctrl+R")
+		}
+
+		firstLine, _, _ := strings.Cut(string(output), "\n")
+		password := strings.TrimSuffix(firstLine, "\r")
+
+		if password == "" {
+			return errors.New("password-cmd printed no password")
+		}
+
+		directory := filepath.Join(b.mirrorDirectory, fmt.Sprintf("%x", sha256.Sum256([]byte(account.Email)))[:16])
+
+		store, err := mirror.Open(directory, []byte(password))
+
+		if errors.Is(err, mirror.ErrWrongPassword) {
+			report("The password doesn't open the mirror. Checking it against the server")
+
+			session, loginErr := imapsync.Dial(ctx, account.IMAP, account.Email, password)
+
+			if loginErr != nil {
+				return fmt.Errorf("the password opens neither the mirror nor the server: %w", loginErr)
+			}
+
+			session.Close()
+
+			report("The server accepted the password, so it has changed. Deleting the mirror to download it again")
+
+			err = mirror.Wipe(directory)
+
+			if err != nil {
+				return err
+			}
+
+			store, err = mirror.Open(directory, []byte(password))
+		}
+
+		if err != nil {
+			return err
+		}
+
+		index := accountIndex{}
+
+		content, err := store.Read("index")
+
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			report("The mirror has no index yet, so this is a fresh mirror")
+
+		case err != nil:
+			return err
+
+		default:
+			err = gob.NewDecoder(bytes.NewReader(content)).Decode(&index)
+
+			if err != nil {
+				return fmt.Errorf("reading the mirror index: %w", err)
+			}
+
+			report("Opened the mirror: %d emails and %d pending reads", len(index.Messages), len(index.PendingReads))
+		}
+
+		if index.Folders == nil {
+			index.Folders = map[string]folderIndex{}
+		}
+
+		opened = &openedAccount{password: password, mirror: store, folders: index.Folders}
+
+		b.mutex.Lock()
+
+		for _, message := range index.Messages {
+			message.Account = account.Name
+
+			if message.ServerFolder == "" {
+				message.ServerFolder = message.Folder
+			}
+
+			b.messages = append(b.messages, message)
+		}
+
+		for _, id := range index.PendingReads {
+			b.pendingSeen[id] = true
+		}
+
+		b.opened[account.Name] = opened
+		b.mutex.Unlock()
+	}
+
+	report("Logging in to %s", account.IMAP)
+
+	session, err := imapsync.Dial(ctx, account.IMAP, account.Email, opened.password)
+
+	if err != nil {
+		return fmt.Errorf("logging in: %w", err)
+	}
+
+	defer session.Close()
+
+	report("Logged in")
+
+	serverFolders, err := session.Folders()
+
+	if err != nil {
+		return fmt.Errorf("listing folders: %w", err)
+	}
+
+	var failures []error
+
+	servers := map[string]string{}
+
+	for _, folder := range account.Folders {
+		specialUse := map[string]string{Sent: `\Sent`, Spam: `\Junk`, Trash: `\Trash`, Archive: `\Archive`}[folder]
+
+		server := ""
+
+		if folder == Inbox {
+			server = "INBOX"
+		}
+
+		for _, candidate := range serverFolders {
+			if specialUse != "" && candidate.SpecialUse == specialUse {
+				server = candidate.Name
+			}
+		}
+
+		if server == "" && (specialUse == "" || folder == Archive) && folder != Inbox {
+			if slices.ContainsFunc(serverFolders, func(candidate imapsync.Folder) bool { return candidate.Name == folder }) {
+				server = folder
+			}
+		}
+
+		if server == "" {
+			report("%s: the server has no matching folder", folder)
+			failures = append(failures, fmt.Errorf("the server has no %s folder", folder))
+			continue
+		}
+
+		report("%s: the server calls it %s", folder, server)
+
+		servers[folder] = server
+	}
+
+	var outbox []Message
+
+	b.mutex.Lock()
+
+	for _, message := range b.messages {
+		if message.Account == account.Name && message.Folder == Outbox {
+			outbox = append(outbox, message)
+		}
+	}
+
+	b.mutex.Unlock()
+
+	removeQueued := func(id string) {
+		b.mutex.Lock()
+		b.messages = slices.DeleteFunc(b.messages, func(m Message) bool { return m.ID == id })
+		b.mutex.Unlock()
+
+		opened.mirror.Remove(bodyFile(id))
+	}
+
+	switch {
+	case len(outbox) == 0:
+		report("Outbox: nothing to send")
+
+	case servers[Sent] == "":
+		report("Outbox: %d to send. The server has no Sent folder, so scry can't check whether an earlier try already sent them", len(outbox))
+
+	default:
+		report("Outbox: %d to send", len(outbox))
+
+		_, err := session.Select(servers[Sent])
+
+		if err != nil {
+			report("Outbox: opening Sent to check for earlier tries failed, so nothing is sent this time: %v", err)
+			failures = append(failures, fmt.Errorf("opening Sent: %w", err))
+			outbox = nil
+		}
+	}
+
+	for _, queued := range outbox {
+		if servers[Sent] != "" {
+			alreadySent, err := session.HasMessageID(queued.MessageID)
+
+			if err != nil {
+				report("Outbox: checking Sent failed, so the rest wait for the next sync: %v", err)
+				failures = append(failures, fmt.Errorf("checking Sent: %w", err))
+				break
+			}
+
+			if alreadySent {
+				report("Outbox: an email is already in Sent, so an earlier try sent it. Removing it from the outbox")
+				removeQueued(queued.ID)
+				continue
+			}
+		}
+
+		content, err := opened.mirror.Read(bodyFile(queued.ID))
+
+		var stored storedBody
+
+		if err == nil {
+			err = gob.NewDecoder(bytes.NewReader(content)).Decode(&stored)
+		}
+
+		if err != nil {
+			report("Outbox: reading a queued email from the mirror failed: %v", err)
+			failures = append(failures, fmt.Errorf("reading a queued email: %w", err))
+			continue
+		}
+
+		b.mutex.Lock()
+
+		stillQueued := slices.ContainsFunc(b.messages, func(m Message) bool { return m.ID == queued.ID })
+
+		if stillQueued {
+			b.sending[queued.ID] = true
+		}
+
+		b.mutex.Unlock()
+
+		if !stillQueued {
+			report("Outbox: an email went back to the draft before it was sent")
+			continue
+		}
+
+		report("Outbox: sending an email to %d recipients through %s", len(stored.Recipients), account.SMTP)
+
+		err = func() error {
+			host, port, err := net.SplitHostPort(account.SMTP)
+
+			if err != nil {
+				return fmt.Errorf("reading the smtp address: %w", err)
+			}
+
+			tlsConfig := &tls.Config{ServerName: host}
+			dialer := &net.Dialer{Timeout: 30 * time.Second}
+
+			var connection net.Conn
+
+			if port == "465" {
+				connection, err = tls.DialWithDialer(dialer, "tcp", account.SMTP, tlsConfig)
+			} else {
+				connection, err = dialer.Dial("tcp", account.SMTP)
+			}
+
+			if err != nil {
+				return fmt.Errorf("connecting to the smtp server: %w", err)
+			}
+
+			connection.SetDeadline(time.Now().Add(time.Minute))
+
+			client, err := smtp.NewClient(connection, host)
+
+			if err != nil {
+				connection.Close()
+				return fmt.Errorf("connecting to the smtp server: %w", err)
+			}
+
+			defer client.Close()
+
+			if port != "465" {
+				connection.SetDeadline(time.Now().Add(time.Minute))
+
+				err = client.StartTLS(tlsConfig)
+
+				if err != nil {
+					return fmt.Errorf("starting TLS: %w", err)
+				}
+			}
+
+			connection.SetDeadline(time.Now().Add(time.Minute))
+
+			err = client.Auth(smtp.PlainAuth("", account.Email, opened.password, host))
+
+			if err != nil {
+				return fmt.Errorf("signing in: %w", err)
+			}
+
+			connection.SetDeadline(time.Now().Add(time.Minute))
+
+			err = client.Mail(account.Email)
+
+			if err != nil {
+				return err
+			}
+
+			for _, recipient := range stored.Recipients {
+				connection.SetDeadline(time.Now().Add(time.Minute))
+
+				err = client.Rcpt(recipient)
+
+				if err != nil {
+					return fmt.Errorf("the server refused %s: %w", recipient, err)
+				}
+			}
+
+			connection.SetDeadline(time.Now().Add(time.Minute))
+
+			data, err := client.Data()
+
+			if err != nil {
+				return err
+			}
+
+			for chunk := range slices.Chunk(stored.Raw, 64<<10) {
+				connection.SetDeadline(time.Now().Add(time.Minute))
+
+				_, err = data.Write(chunk)
+
+				if err != nil {
+					return err
+				}
+			}
+
+			// RFC 5321 asks clients to wait 10 minutes for the reply to the end of the data, because servers may scan the email first.
+			connection.SetDeadline(time.Now().Add(10 * time.Minute))
+
+			err = data.Close()
+
+			if err != nil {
+				return err
+			}
+
+			// The server has accepted the email once DATA ends, so a failed QUIT must not report a failed send.
+			connection.SetDeadline(time.Now().Add(time.Minute))
+			client.Quit()
+
+			return nil
+		}()
+
+		b.mutex.Lock()
+		delete(b.sending, queued.ID)
+		b.mutex.Unlock()
+
+		if err != nil {
+			report("Outbox: sending failed, so the email waits for the next sync: %v", err)
+			failures = append(failures, fmt.Errorf("sending: %w", err))
+			continue
+		}
+
+		report("Outbox: sent")
+		removeQueued(queued.ID)
+	}
+
+	pendingMoves := map[string][]Message{}
+
+	b.mutex.Lock()
+
+	for _, message := range b.messages {
+		if message.Account == account.Name && message.Folder != message.ServerFolder {
+			pendingMoves[message.ServerFolder] = append(pendingMoves[message.ServerFolder], message)
+		}
+	}
+
+	b.mutex.Unlock()
+
+	if len(pendingMoves) == 0 {
+		report("Moves: nothing to move")
+	}
+
+	for _, source := range account.Folders {
+		moves := pendingMoves[source]
+		sourceServer := servers[source]
+
+		if len(moves) == 0 {
+			continue
+		}
+
+		if sourceServer == "" {
+			report("%s: %d moves wait, because the server has no %s folder", source, len(moves), source)
+			continue
+		}
+
+		uidValidity, err := session.Select(sourceServer)
+
+		if err != nil {
+			report("%s: opening the folder to move %d emails failed: %v", source, len(moves), err)
+			failures = append(failures, fmt.Errorf("opening %s: %w", source, err))
+			continue
+		}
+
+		var uids []uint32
+
+		for _, message := range moves {
+			uids = append(uids, message.UID)
+		}
+
+		present := map[uint32]bool{}
+		known := opened.folders[source]
+
+		if known.Server == sourceServer && known.UIDValidity == uidValidity {
+			present, err = session.Seen(uids)
+
+			if err != nil {
+				report("%s: checking %d emails to move failed: %v", source, len(moves), err)
+				failures = append(failures, fmt.Errorf("checking emails to move from %s: %w", source, err))
+				continue
+			}
+		} else {
+			report("%s: the folder was rebuilt on the server, so its %d moves can't be matched", source, len(moves))
+		}
+
+		dropped := map[string]bool{}
+		byDestination := map[string][]uint32{}
+
+		for _, message := range moves {
+			_, onServer := present[message.UID]
+
+			if !onServer {
+				dropped[message.ID] = true
+				continue
+			}
+
+			byDestination[message.Folder] = append(byDestination[message.Folder], message.UID)
+		}
+
+		b.mutex.Lock()
+
+		b.messages = slices.DeleteFunc(b.messages, func(m Message) bool { return dropped[m.ID] })
+
+		for id := range dropped {
+			delete(b.pendingSeen, id)
+		}
+
+		b.mutex.Unlock()
+
+		for id := range dropped {
+			opened.mirror.Remove(bodyFile(id))
+		}
+
+		movedCount := 0
+
+		for _, destination := range account.Folders {
+			destinationUIDs := byDestination[destination]
+
+			if len(destinationUIDs) == 0 {
+				continue
+			}
+
+			if servers[destination] == "" {
+				report("%s: %d moves to %s wait, because the server has no %s folder", source, len(destinationUIDs), destination, destination)
+				continue
+			}
+
+			moved, err := session.Move(destinationUIDs, servers[destination])
+
+			if err != nil {
+				report("%s: moving %d emails to %s failed: %v", source, len(destinationUIDs), destination, err)
+				failures = append(failures, fmt.Errorf("moving email from %s to %s: %w", source, destination, err))
+				continue
+			}
+
+			if len(moved) < len(destinationUIDs) {
+				report("%s: the server confirmed %d of %d moves to %s. The rest stay pending", source, len(moved), len(destinationUIDs), destination)
+			}
+
+			b.mutex.Lock()
+
+			for i, message := range b.messages {
+				newUID, ok := moved[message.UID]
+
+				if ok && message.Account == account.Name && message.ServerFolder == source {
+					b.messages[i].ServerFolder = destination
+					b.messages[i].UID = newUID
+				}
+			}
+
+			b.mutex.Unlock()
+
+			movedCount += len(moved)
+		}
+
+		report("%s: moved %d, dropped %d already moved or deleted elsewhere", source, movedCount, len(dropped))
+	}
+
+	pushedReads := 0
+
+	for _, folder := range account.Folders {
+		server, ok := servers[folder]
+
+		if !ok {
+			continue
+		}
+
+		var pendingIDs []string
+		var pendingUIDs []uint32
+
+		b.mutex.Lock()
+
+		for _, message := range b.messages {
+			if message.Account == account.Name && message.ServerFolder == folder && b.pendingSeen[message.ID] {
+				pendingIDs = append(pendingIDs, message.ID)
+				pendingUIDs = append(pendingUIDs, message.UID)
+			}
+		}
+
+		b.mutex.Unlock()
+
+		if len(pendingIDs) == 0 {
+			continue
+		}
+
+		uidValidity, err := session.Select(server)
+
+		if err != nil {
+			report("%s: opening the folder to mark %d read failed: %v", folder, len(pendingIDs), err)
+			failures = append(failures, fmt.Errorf("opening %s: %w", folder, err))
+			continue
+		}
+
+		known := opened.folders[folder]
+
+		if known.Server != server || known.UIDValidity != uidValidity {
+			report("%s: the folder was rebuilt on the server, so its %d pending reads can't be matched", folder, len(pendingIDs))
+			continue
+		}
+
+		err = session.MarkSeen(pendingUIDs)
+
+		if err != nil {
+			report("%s: marking %d read failed: %v", folder, len(pendingIDs), err)
+			failures = append(failures, fmt.Errorf("marking email read in %s: %w", folder, err))
+			continue
+		}
+
+		b.mutex.Lock()
+
+		for _, id := range pendingIDs {
+			delete(b.pendingSeen, id)
+		}
+
+		b.mutex.Unlock()
+
+		report("%s: marked %d read on the server", folder, len(pendingIDs))
+
+		pushedReads += len(pendingIDs)
+	}
+
+	if pushedReads == 0 {
+		report("Reads: nothing to mark read")
+	}
+
 	type plannedFolder struct {
 		folder      string
 		server      string
@@ -350,20 +951,172 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 		fresh       []uint32
 	}
 
-	type accountPlan struct {
-		account Account
-		opened  *openedAccount
-		folders []plannedFolder
+	var planned []plannedFolder
+
+	for _, folder := range account.Folders {
+		server, ok := servers[folder]
+
+		if !ok {
+			continue
+		}
+
+		uidValidity, err := session.Select(server)
+
+		if err != nil {
+			report("%s: opening the folder failed: %v", folder, err)
+			failures = append(failures, fmt.Errorf("opening %s: %w", folder, err))
+			continue
+		}
+
+		known := opened.folders[folder]
+
+		if known.Server != server || known.UIDValidity != uidValidity {
+			var dropped []string
+
+			b.mutex.Lock()
+
+			b.messages = slices.DeleteFunc(b.messages, func(m Message) bool {
+				drop := m.Account == account.Name && m.ServerFolder == folder
+
+				if drop {
+					dropped = append(dropped, m.ID)
+				}
+
+				return drop
+			})
+
+			opened.folders[folder] = folderIndex{Server: server, UIDValidity: uidValidity}
+
+			b.mutex.Unlock()
+
+			for _, id := range dropped {
+				opened.mirror.Remove(bodyFile(id))
+			}
+
+			if known.Server == "" {
+				report("%s: first sync of this folder", folder)
+			} else {
+				report("%s: the folder was rebuilt on the server, so its %d local copies are dropped and download again", folder, len(dropped))
+			}
+		}
+
+		since := time.Time{}
+
+		if folder == Archive || folder == Sent {
+			since = time.Now().AddDate(0, 0, -b.historyDays)
+		}
+
+		uids, err := session.Search(since)
+
+		if err != nil {
+			report("%s: searching failed: %v", folder, err)
+			failures = append(failures, fmt.Errorf("searching %s: %w", folder, err))
+			continue
+		}
+
+		if since.IsZero() {
+			report("%s: the server holds %d emails", folder, len(uids))
+		} else {
+			report("%s: the server holds %d emails from the last %d days", folder, len(uids), b.historyDays)
+		}
+
+		seen, err := session.Seen(uids)
+
+		if err != nil {
+			report("%s: reading flags failed: %v", folder, err)
+			failures = append(failures, fmt.Errorf("reading flags in %s: %w", folder, err))
+			continue
+		}
+
+		knownUIDs := map[uint32]bool{}
+		var removed []string
+		readChanges := 0
+		heldReads := 0
+
+		b.mutex.Lock()
+
+		for _, message := range b.messages {
+			if message.Account == account.Name && message.ServerFolder == folder {
+				knownUIDs[message.UID] = true
+			}
+		}
+
+		b.messages = slices.DeleteFunc(b.messages, func(m Message) bool {
+			_, onServer := seen[m.UID]
+			remove := m.Account == account.Name && m.ServerFolder == folder && !onServer
+
+			if remove {
+				removed = append(removed, m.ID)
+			}
+
+			return remove
+		})
+
+		for i, message := range b.messages {
+			if message.Account != account.Name || message.ServerFolder != folder {
+				continue
+			}
+
+			if b.pendingSeen[message.ID] {
+				heldReads++
+				continue
+			}
+
+			unread := !seen[message.UID]
+
+			if message.Unread != unread {
+				readChanges++
+			}
+
+			b.messages[i].Unread = unread
+		}
+
+		b.mutex.Unlock()
+
+		for _, id := range removed {
+			opened.mirror.Remove(bodyFile(id))
+		}
+
+		var fresh []uint32
+
+		for _, uid := range uids {
+			if !knownUIDs[uid] {
+				fresh = append(fresh, uid)
+			}
+		}
+
+		report("%s: %d removed elsewhere, %d changed read state elsewhere, %d new", folder, len(removed), readChanges, len(fresh))
+
+		if heldReads > 0 {
+			report("%s: kept %d local reads that haven't reached the server yet", folder, heldReads)
+		}
+
+		planned = append(planned, plannedFolder{folder: folder, server: server, uidValidity: uidValidity, fresh: fresh})
 	}
 
-	var plans []accountPlan
+	total := 0
+
+	for _, folder := range planned {
+		total += len(folder.fresh)
+	}
 
 	b.mutex.Lock()
-	b.syncDone = 0
-	b.syncTotal = 0
+	b.progress[account.Name] = syncCount{total: total}
 	b.mutex.Unlock()
 
+	err = b.saveIndex(account.Name, opened)
+
+	if err != nil {
+		report("Saving the mirror index failed: %v", err)
+		failures = append(failures, err)
+	}
+
+	if total == 0 {
+		report("Downloads: nothing new")
+	}
+
 	carrierGradeNAT := netip.MustParsePrefix("100.64.0.0/10")
+	errPrivateAddress := errors.New("refusing to fetch an image from a private address")
 
 	imageClient := &http.Client{
 		Timeout: 15 * time.Second,
@@ -387,7 +1140,7 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 					ip = ip.Unmap()
 
 					if !ip.IsGlobalUnicast() || ip.IsPrivate() || carrierGradeNAT.Contains(ip) {
-						return fmt.Errorf("refusing to fetch an image from %s", ip)
+						return errPrivateAddress
 					}
 
 					return nil
@@ -398,637 +1151,345 @@ func (b *Mailbox) Sync(ctx context.Context, report func(format string, arguments
 		},
 	}
 
-	var failures []error
+	lastSaved := time.Now()
 
-	for _, account := range b.Accounts() {
-		err := func() error {
-			b.mutex.Lock()
-			opened := b.opened[account.Name]
-			b.mutex.Unlock()
+	for _, planned := range planned {
+		folder := planned.folder
+		uidValidity := planned.uidValidity
+		fresh := planned.fresh
 
-			if opened == nil {
-				words := strings.Fields(account.PasswordCommand)
-
-				if len(words) == 0 {
-					return errors.New("the config has no password-cmd")
-				}
-
-				output, err := exec.CommandContext(ctx, words[0], words[1:]...).Output()
-
-				if err != nil {
-					return errors.New("couldn't get the password. Unlock your password store and press Ctrl+R")
-				}
-
-				firstLine, _, _ := strings.Cut(string(output), "\n")
-				password := strings.TrimSuffix(firstLine, "\r")
-
-				if password == "" {
-					return errors.New("password-cmd printed no password")
-				}
-
-				directory := filepath.Join(b.mirrorDirectory, fmt.Sprintf("%x", sha256.Sum256([]byte(account.Email)))[:16])
-
-				store, err := mirror.Open(directory, []byte(password))
-
-				if errors.Is(err, mirror.ErrWrongPassword) {
-					session, loginErr := imapsync.Dial(ctx, account.IMAP, account.Email, password)
-
-					if loginErr != nil {
-						return fmt.Errorf("the password opens neither the mirror nor the server: %w", loginErr)
-					}
-
-					session.Close()
-
-					err = mirror.Wipe(directory)
-
-					if err != nil {
-						return err
-					}
-
-					store, err = mirror.Open(directory, []byte(password))
-				}
-
-				if err != nil {
-					return err
-				}
-
-				index := accountIndex{}
-
-				content, err := store.Read("index")
-
-				switch {
-				case errors.Is(err, fs.ErrNotExist):
-
-				case err != nil:
-					return err
-
-				default:
-					err = gob.NewDecoder(bytes.NewReader(content)).Decode(&index)
-
-					if err != nil {
-						return fmt.Errorf("reading the mirror index: %w", err)
-					}
-				}
-
-				if index.Folders == nil {
-					index.Folders = map[string]folderIndex{}
-				}
-
-				opened = &openedAccount{password: password, mirror: store, folders: index.Folders}
-
-				b.mutex.Lock()
-
-				for _, message := range index.Messages {
-					message.Account = account.Name
-
-					if message.ServerFolder == "" {
-						message.ServerFolder = message.Folder
-					}
-
-					b.messages = append(b.messages, message)
-				}
-
-				for _, id := range index.PendingReads {
-					b.pendingSeen[id] = true
-				}
-
-				b.opened[account.Name] = opened
-				b.mutex.Unlock()
-			}
-
-			plan := accountPlan{account: account, opened: opened}
-			defer func() { plans = append(plans, plan) }()
-
-			session, err := imapsync.Dial(ctx, account.IMAP, account.Email, opened.password)
-
-			if err != nil {
-				return fmt.Errorf("logging in: %w", err)
-			}
-
-			defer session.Close()
-
-			serverFolders, err := session.Folders()
-
-			if err != nil {
-				return fmt.Errorf("listing folders: %w", err)
-			}
-
-			var folderFailures []error
-
-			servers := map[string]string{}
-
-			for _, folder := range account.Folders {
-				specialUse := map[string]string{Sent: `\Sent`, Spam: `\Junk`, Trash: `\Trash`, Archive: `\Archive`}[folder]
-
-				server := ""
-
-				if folder == Inbox {
-					server = "INBOX"
-				}
-
-				for _, candidate := range serverFolders {
-					if specialUse != "" && candidate.SpecialUse == specialUse {
-						server = candidate.Name
-					}
-				}
-
-				if server == "" && (specialUse == "" || folder == Archive) && folder != Inbox {
-					if slices.ContainsFunc(serverFolders, func(candidate imapsync.Folder) bool { return candidate.Name == folder }) {
-						server = folder
-					}
-				}
-
-				if server == "" {
-					folderFailures = append(folderFailures, fmt.Errorf("the server has no %s folder", folder))
-					continue
-				}
-
-				servers[folder] = server
-			}
-
-			pendingMoves := map[string][]Message{}
-
-			b.mutex.Lock()
-
-			for _, message := range b.messages {
-				if message.Account == account.Name && message.Folder != message.ServerFolder {
-					pendingMoves[message.ServerFolder] = append(pendingMoves[message.ServerFolder], message)
-				}
-			}
-
-			b.mutex.Unlock()
-
-			for _, source := range account.Folders {
-				moves := pendingMoves[source]
-				sourceServer := servers[source]
-
-				if len(moves) == 0 || sourceServer == "" {
-					continue
-				}
-
-				uidValidity, err := session.Select(sourceServer)
-
-				if err != nil {
-					folderFailures = append(folderFailures, fmt.Errorf("opening %s: %w", source, err))
-					continue
-				}
-
-				var uids []uint32
-
-				for _, message := range moves {
-					uids = append(uids, message.UID)
-				}
-
-				present := map[uint32]bool{}
-				known := opened.folders[source]
-
-				if known.Server == sourceServer && known.UIDValidity == uidValidity {
-					present, err = session.Seen(uids)
-
-					if err != nil {
-						folderFailures = append(folderFailures, fmt.Errorf("checking emails to move from %s: %w", source, err))
-						continue
-					}
-				}
-
-				dropped := map[string]bool{}
-				byDestination := map[string][]uint32{}
-
-				for _, message := range moves {
-					_, onServer := present[message.UID]
-
-					if !onServer {
-						dropped[message.ID] = true
-						continue
-					}
-
-					byDestination[message.Folder] = append(byDestination[message.Folder], message.UID)
-				}
-
-				b.mutex.Lock()
-
-				b.messages = slices.DeleteFunc(b.messages, func(m Message) bool { return dropped[m.ID] })
-
-				for id := range dropped {
-					delete(b.pendingSeen, id)
-				}
-
-				b.mutex.Unlock()
-
-				for id := range dropped {
-					opened.mirror.Remove(bodyFile(id))
-				}
-
-				movedCount := 0
-
-				for _, destination := range account.Folders {
-					destinationUIDs := byDestination[destination]
-
-					if len(destinationUIDs) == 0 || servers[destination] == "" {
-						continue
-					}
-
-					moved, err := session.Move(destinationUIDs, servers[destination])
-
-					if err != nil {
-						folderFailures = append(folderFailures, fmt.Errorf("moving email from %s to %s: %w", source, destination, err))
-						continue
-					}
-
-					b.mutex.Lock()
-
-					for i, message := range b.messages {
-						newUID, ok := moved[message.UID]
-
-						if ok && message.Account == account.Name && message.ServerFolder == source {
-							b.messages[i].ServerFolder = destination
-							b.messages[i].UID = newUID
-						}
-					}
-
-					b.mutex.Unlock()
-
-					movedCount += len(moved)
-				}
-
-				report("%s %s: moved %d, dropped %d already moved or deleted elsewhere", account.Name, source, movedCount, len(dropped))
-			}
-
-			for _, folder := range account.Folders {
-				server, ok := servers[folder]
-
-				if !ok {
-					continue
-				}
-
-				uidValidity, err := session.Select(server)
-
-				if err != nil {
-					folderFailures = append(folderFailures, fmt.Errorf("opening %s: %w", folder, err))
-					continue
-				}
-
-				known := opened.folders[folder]
-
-				if known.Server != server || known.UIDValidity != uidValidity {
-					var dropped []string
-
-					b.mutex.Lock()
-
-					b.messages = slices.DeleteFunc(b.messages, func(m Message) bool {
-						drop := m.Account == account.Name && m.ServerFolder == folder
-
-						if drop {
-							dropped = append(dropped, m.ID)
-						}
-
-						return drop
-					})
-
-					opened.folders[folder] = folderIndex{Server: server, UIDValidity: uidValidity}
-
-					b.mutex.Unlock()
-
-					for _, id := range dropped {
-						opened.mirror.Remove(bodyFile(id))
-					}
-				}
-
-				since := time.Time{}
-
-				if folder == Archive || folder == Sent {
-					since = time.Now().AddDate(0, 0, -b.historyDays)
-				}
-
-				uids, err := session.Search(since)
-
-				if err != nil {
-					folderFailures = append(folderFailures, fmt.Errorf("searching %s: %w", folder, err))
-					continue
-				}
-
-				knownUIDs := map[uint32]bool{}
-				var pendingIDs []string
-				var pendingUIDs []uint32
-
-				b.mutex.Lock()
-
-				for _, message := range b.messages {
-					if message.Account != account.Name || message.ServerFolder != folder {
-						continue
-					}
-
-					knownUIDs[message.UID] = true
-
-					if b.pendingSeen[message.ID] {
-						pendingIDs = append(pendingIDs, message.ID)
-						pendingUIDs = append(pendingUIDs, message.UID)
-					}
-				}
-
-				b.mutex.Unlock()
-
-				err = session.MarkSeen(pendingUIDs)
-
-				if err != nil {
-					folderFailures = append(folderFailures, fmt.Errorf("marking email read in %s: %w", folder, err))
-					continue
-				}
-
-				seen, err := session.Seen(uids)
-
-				if err != nil {
-					folderFailures = append(folderFailures, fmt.Errorf("reading flags in %s: %w", folder, err))
-					continue
-				}
-
-				var fresh []uint32
-
-				for _, uid := range uids {
-					if !knownUIDs[uid] {
-						fresh = append(fresh, uid)
-					}
-				}
-
-				var removed []string
-
-				b.mutex.Lock()
-
-				for _, id := range pendingIDs {
-					delete(b.pendingSeen, id)
-				}
-
-				b.messages = slices.DeleteFunc(b.messages, func(m Message) bool {
-					_, onServer := seen[m.UID]
-					remove := m.Account == account.Name && m.ServerFolder == folder && !onServer
-
-					if remove {
-						removed = append(removed, m.ID)
-					}
-
-					return remove
-				})
-
-				for i, message := range b.messages {
-					if message.Account == account.Name && message.ServerFolder == folder && !b.pendingSeen[message.ID] {
-						b.messages[i].Unread = !seen[message.UID]
-					}
-				}
-
-				b.mutex.Unlock()
-
-				for _, id := range removed {
-					opened.mirror.Remove(bodyFile(id))
-				}
-
-				plan.folders = append(plan.folders, plannedFolder{folder: folder, server: server, uidValidity: uidValidity, fresh: fresh})
-			}
-
-			err = b.saveIndex(account.Name, opened)
-
-			if err != nil {
-				folderFailures = append(folderFailures, err)
-			}
-
-			return errors.Join(folderFailures...)
-		}()
-
-		if err != nil {
-			failures = append(failures, fmt.Errorf("%s: %w", account.Name, err))
-		}
-	}
-
-	total := 0
-
-	for _, plan := range plans {
-		for _, planned := range plan.folders {
-			total += len(planned.fresh)
-		}
-	}
-
-	b.mutex.Lock()
-	b.syncTotal = total
-	b.mutex.Unlock()
-
-	for _, plan := range plans {
-		account := plan.account
-		opened := plan.opened
-
-		if !slices.ContainsFunc(plan.folders, func(planned plannedFolder) bool { return len(planned.fresh) > 0 }) {
+		if len(fresh) == 0 {
 			continue
 		}
 
-		err := func() error {
-			session, err := imapsync.Dial(ctx, account.IMAP, account.Email, opened.password)
+		noun := "emails"
+		if len(fresh) == 1 {
+			noun = "email"
+		}
 
-			if err != nil {
-				return fmt.Errorf("logging in: %w", err)
+		report("%s: downloading %d %s", folder, len(fresh), noun)
+
+		selectedValidity, err := session.Select(planned.server)
+
+		if err != nil || selectedValidity != uidValidity {
+			report("%s: the folder changed during sync, so its downloads wait for the next sync", folder)
+			failures = append(failures, fmt.Errorf("%s changed during sync. Press Ctrl+R to try again", folder))
+			continue
+		}
+
+		before, _ := b.SyncProgress(account.Name)
+
+		err = session.Fetch(fresh, func(batch []imapsync.Fetched) error {
+			messages := make([]Message, len(batch))
+
+			var imageMutex sync.Mutex
+			imageOutcomes := map[string]int{}
+
+			countImage := func(outcome string) {
+				imageMutex.Lock()
+				imageOutcomes[outcome]++
+				imageMutex.Unlock()
 			}
 
-			defer session.Close()
+			group, groupCtx := errgroup.WithContext(ctx)
+			group.SetLimit(8)
 
-			var folderFailures []error
+			for i, fetched := range batch {
+				group.Go(func() error {
+					body := fetched.HTML
 
-			lastSaved := time.Now()
+					if folder == Spam && body != "" {
+						countImage("skipped in Spam")
+					}
 
-			for _, planned := range plan.folders {
-				folder := planned.folder
-				uidValidity := planned.uidValidity
-				fresh := planned.fresh
+					if folder != Spam && body != "" {
+						document, err := html.Parse(strings.NewReader(body))
 
-				if len(fresh) == 0 {
-					continue
-				}
+						if err != nil {
+							countImage("skipped in unreadable HTML")
+						}
 
-				noun := "emails"
-				if len(fresh) == 1 {
-					noun = "email"
-				}
+						if err == nil {
+							downloaded := map[string]string{}
 
-				report("%s %s: downloading %d %s", account.Name, folder, len(fresh), noun)
+							for node := range document.Descendants() {
+								if node.Type != html.ElementNode || node.Data != "img" {
+									continue
+								}
 
-				selectedValidity, err := session.Select(planned.server)
+								node.Attr = slices.DeleteFunc(node.Attr, func(attribute html.Attribute) bool { return attribute.Key == "srcset" })
 
-				if err != nil || selectedValidity != uidValidity {
-					folderFailures = append(folderFailures, fmt.Errorf("%s changed during sync. Press Ctrl+R to try again", folder))
-					continue
-				}
+								for a, attribute := range node.Attr {
+									if attribute.Key != "src" || !(strings.HasPrefix(attribute.Val, "https://") || strings.HasPrefix(attribute.Val, "http://")) {
+										continue
+									}
 
-				before, _ := b.SyncProgress()
+									_, done := downloaded[attribute.Val]
 
-				err = session.Fetch(fresh, func(batch []imapsync.Fetched) error {
-					messages := make([]Message, len(batch))
+									if !done {
+										downloaded[attribute.Val] = ""
 
-					group, groupCtx := errgroup.WithContext(ctx)
-					group.SetLimit(8)
+										request, err := http.NewRequestWithContext(groupCtx, http.MethodGet, attribute.Val, nil)
 
-					for i, fetched := range batch {
-						group.Go(func() error {
-							body := fetched.HTML
-
-							if folder != Spam && body != "" {
-								document, err := html.Parse(strings.NewReader(body))
-
-								if err == nil {
-									downloaded := map[string]string{}
-
-									for node := range document.Descendants() {
-										if node.Type != html.ElementNode || node.Data != "img" {
+										if err != nil {
+											countImage("unusable address")
 											continue
 										}
 
-										node.Attr = slices.DeleteFunc(node.Attr, func(attribute html.Attribute) bool { return attribute.Key == "srcset" })
+										response, err := imageClient.Do(request)
 
-										for a, attribute := range node.Attr {
-											if attribute.Key != "src" || !(strings.HasPrefix(attribute.Val, "https://") || strings.HasPrefix(attribute.Val, "http://")) {
-												continue
-											}
-
-											_, done := downloaded[attribute.Val]
-
-											if !done {
-												downloaded[attribute.Val] = ""
-
-												request, err := http.NewRequestWithContext(groupCtx, http.MethodGet, attribute.Val, nil)
-
-												if err != nil {
-													continue
-												}
-
-												response, err := imageClient.Do(request)
-
-												if err != nil {
-													continue
-												}
-
-												image, err := io.ReadAll(io.LimitReader(response.Body, 5<<20+1))
-												response.Body.Close()
-
-												if err != nil || response.StatusCode != http.StatusOK || len(image) > 5<<20 {
-													continue
-												}
-
-												contentType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
-
-												if !strings.HasPrefix(contentType, "image/") {
-													contentType = http.DetectContentType(image)
-												}
-
-												if !strings.HasPrefix(contentType, "image/") {
-													continue
-												}
-
-												downloaded[attribute.Val] = "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(image)
-											}
-
-											if downloaded[attribute.Val] != "" {
-												node.Attr[a].Val = downloaded[attribute.Val]
-											}
+										if errors.Is(err, errPrivateAddress) {
+											countImage("refused private address")
+											continue
 										}
+
+										if err != nil {
+											countImage("unreachable")
+											continue
+										}
+
+										image, err := io.ReadAll(io.LimitReader(response.Body, 5<<20+1))
+										response.Body.Close()
+
+										switch {
+										case err != nil:
+											countImage("interrupted")
+											continue
+
+										case response.StatusCode != http.StatusOK:
+											countImage("refused by the image server")
+											continue
+
+										case len(image) > 5<<20:
+											countImage("over 5 MB")
+											continue
+										}
+
+										contentType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
+
+										if !strings.HasPrefix(contentType, "image/") {
+											contentType = http.DetectContentType(image)
+										}
+
+										if !strings.HasPrefix(contentType, "image/") {
+											countImage("not an image")
+											continue
+										}
+
+										countImage("saved")
+
+										downloaded[attribute.Val] = "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(image)
 									}
 
-									var rendered strings.Builder
-
-									err = html.Render(&rendered, document)
-
-									if err == nil {
-										body = rendered.String()
+									if downloaded[attribute.Val] != "" {
+										node.Attr[a].Val = downloaded[attribute.Val]
 									}
 								}
 							}
 
-							id := fmt.Sprintf("%s:%s:%d:%d", account.Email, folder, uidValidity, fetched.UID)
+							var rendered strings.Builder
 
-							message := Message{
-								ID:           id,
-								Account:      account.Name,
-								Folder:       folder,
-								ServerFolder: folder,
-								From:         Address{Name: fetched.From.Name, Email: fetched.From.Email},
-								Subject:      fetched.Subject,
-								Date:         fetched.Date,
-								MessageID:    fetched.MessageID,
-								References:   fetched.References,
-								Unread:       !fetched.Seen,
-								Text:         fetched.Text,
-								UID:          fetched.UID,
+							err = html.Render(&rendered, document)
+
+							if err == nil {
+								body = rendered.String()
 							}
-
-							for _, recipient := range fetched.To {
-								message.To = append(message.To, Address{Name: recipient.Name, Email: recipient.Email})
-							}
-
-							stored := storedBody{HTML: body}
-
-							for _, attachment := range fetched.Attachments {
-								stored.Attachments = append(stored.Attachments, Attachment{Name: attachment.Name, ContentType: attachment.ContentType, Data: attachment.Data})
-								message.Attachments = append(message.Attachments, Attachment{Name: attachment.Name, ContentType: attachment.ContentType})
-							}
-
-							var encoded bytes.Buffer
-
-							err := gob.NewEncoder(&encoded).Encode(stored)
-
-							if err != nil {
-								return err
-							}
-
-							err = opened.mirror.Write(bodyFile(id), encoded.Bytes())
-
-							if err != nil {
-								return err
-							}
-
-							messages[i] = message
-
-							return nil
-						})
+						}
 					}
 
-					err := group.Wait()
+					id := fmt.Sprintf("%s:%s:%d:%d", account.Email, folder, uidValidity, fetched.UID)
+
+					message := Message{
+						ID:           id,
+						Account:      account.Name,
+						Folder:       folder,
+						ServerFolder: folder,
+						From:         Address{Name: fetched.From.Name, Email: fetched.From.Email},
+						Subject:      fetched.Subject,
+						Date:         fetched.Date,
+						MessageID:    fetched.MessageID,
+						References:   fetched.References,
+						Unread:       !fetched.Seen,
+						Text:         fetched.Text,
+						UID:          fetched.UID,
+					}
+
+					for _, recipient := range fetched.To {
+						message.To = append(message.To, Address{Name: recipient.Name, Email: recipient.Email})
+					}
+
+					stored := storedBody{HTML: body}
+
+					for _, attachment := range fetched.Attachments {
+						stored.Attachments = append(stored.Attachments, Attachment{Name: attachment.Name, ContentType: attachment.ContentType, Data: attachment.Data})
+						message.Attachments = append(message.Attachments, Attachment{Name: attachment.Name, ContentType: attachment.ContentType})
+					}
+
+					var encoded bytes.Buffer
+
+					err := gob.NewEncoder(&encoded).Encode(stored)
 
 					if err != nil {
 						return err
 					}
 
-					b.mutex.Lock()
-					b.messages = append(b.messages, messages...)
-					b.syncDone += len(messages)
-					b.mutex.Unlock()
+					err = opened.mirror.Write(bodyFile(id), encoded.Bytes())
 
-					if time.Since(lastSaved) < 30*time.Second {
-						return nil
+					if err != nil {
+						return err
 					}
 
-					lastSaved = time.Now()
+					messages[i] = message
 
-					return b.saveIndex(account.Name, opened)
+					return nil
 				})
-
-				after, _ := b.SyncProgress()
-
-				report("%s %s: downloaded %d of %d", account.Name, folder, after-before, len(fresh))
-
-				if err != nil {
-					folderFailures = append(folderFailures, fmt.Errorf("downloading %s: %w", folder, err))
-				}
 			}
 
-			err = b.saveIndex(account.Name, opened)
+			err := group.Wait()
 
 			if err != nil {
-				folderFailures = append(folderFailures, err)
+				report("%s: saving a batch of %d failed: %v", folder, len(batch), err)
+				return err
 			}
 
-			return errors.Join(folderFailures...)
-		}()
+			b.mutex.Lock()
+			b.messages = append(b.messages, messages...)
+			count := b.progress[account.Name]
+			count.done += len(messages)
+			b.progress[account.Name] = count
+			b.mutex.Unlock()
+
+			report("%s: saved %d emails, %d of %d this sync", folder, len(messages), count.done, count.total)
+
+			if len(imageOutcomes) > 0 {
+				var outcomes []string
+
+				for outcome, number := range imageOutcomes {
+					outcomes = append(outcomes, fmt.Sprintf("%d %s", number, outcome))
+				}
+
+				slices.Sort(outcomes)
+
+				report("%s: remote images: %s", folder, strings.Join(outcomes, ", "))
+			}
+
+			if time.Since(lastSaved) < 30*time.Second {
+				return nil
+			}
+
+			lastSaved = time.Now()
+
+			report("Saving the mirror index mid-download")
+
+			return b.saveIndex(account.Name, opened)
+		})
+
+		after, _ := b.SyncProgress(account.Name)
+
+		report("%s: downloaded %d of %d", folder, after-before, len(fresh))
 
 		if err != nil {
-			failures = append(failures, fmt.Errorf("%s: %w", account.Name, err))
+			report("%s: downloading stopped: %v", folder, err)
+			failures = append(failures, fmt.Errorf("downloading %s: %w", folder, err))
 		}
 	}
 
+	err = b.saveIndex(account.Name, opened)
+
+	if err != nil {
+		report("Saving the mirror index failed: %v", err)
+		failures = append(failures, err)
+	}
+
 	return errors.Join(failures...)
+}
+
+func (b *Mailbox) Unqueue(id string) (Draft, error) {
+	message, ok := b.Get(id)
+
+	if !ok || message.Folder != Outbox {
+		return Draft{}, errors.New("this email isn't in the Outbox any more")
+	}
+
+	b.mutex.Lock()
+	opened := b.opened[message.Account]
+	b.mutex.Unlock()
+
+	content, err := opened.mirror.Read(bodyFile(id))
+
+	if err != nil {
+		return Draft{}, err
+	}
+
+	var stored storedBody
+
+	err = gob.NewDecoder(bytes.NewReader(content)).Decode(&stored)
+
+	if err != nil {
+		return Draft{}, err
+	}
+
+	b.mutex.Lock()
+
+	if b.sending[id] {
+		b.mutex.Unlock()
+		return Draft{}, errors.New("this email is being sent right now")
+	}
+
+	b.messages = slices.DeleteFunc(b.messages, func(m Message) bool { return m.ID == id })
+
+	b.mutex.Unlock()
+
+	opened.mirror.Remove(bodyFile(id))
+
+	return stored.Draft, b.saveIndex(message.Account, opened)
+}
+
+func (b *Mailbox) WatchInbox(ctx context.Context, accountName string, report func(format string, arguments ...any)) error {
+	account, ok := b.Account(accountName)
+
+	if !ok {
+		return fmt.Errorf("no account called %s", accountName)
+	}
+
+	b.mutex.Lock()
+	opened := b.opened[account.Name]
+	b.mutex.Unlock()
+
+	if opened == nil {
+		return errors.New("the account isn't unlocked yet")
+	}
+
+	session, err := imapsync.Dial(ctx, account.IMAP, account.Email, opened.password)
+
+	if err != nil {
+		return fmt.Errorf("logging in: %w", err)
+	}
+
+	defer session.Close()
+
+	_, err = session.Select("INBOX")
+
+	if err != nil {
+		return fmt.Errorf("opening Inbox: %w", err)
+	}
+
+	report("Inbox watch: waiting for the server to report new mail")
+
+	for {
+		changed, err := session.Idle(ctx, 10*time.Minute)
+
+		if err != nil {
+			return err
+		}
+
+		if changed {
+			report("Inbox watch: the server reported a change")
+			return nil
+		}
+
+		report("Inbox watch: renewing after 10 quiet minutes")
+	}
 }
 
 func (b *Mailbox) saveIndex(accountName string, opened *openedAccount) error {
@@ -1080,7 +1541,7 @@ func bodyFile(id string) string {
 	return fmt.Sprintf("messages/%x", sha256.Sum256([]byte(id)))[:9+32]
 }
 
-func (b *Mailbox) Send(draft Draft) error {
+func (b *Mailbox) Queue(draft Draft) error {
 	account, ok := b.Account(draft.Account)
 
 	if !ok {
@@ -1103,14 +1564,22 @@ func (b *Mailbox) Send(draft Draft) error {
 
 	_, domain, _ := strings.Cut(account.Email, "@")
 
+	now := time.Now()
+
 	var header mail.Header
 
-	header.SetDate(time.Now())
+	header.SetDate(now)
 	header.SetAddressList("From", []*mail.Address{{Address: account.Email}})
 	header.SetAddressList("To", recipients)
 	header.SetSubject(draft.Subject)
 
 	err = header.GenerateMessageIDWithHostname(domain)
+
+	if err != nil {
+		return err
+	}
+
+	messageID, err := header.MessageID()
 
 	if err != nil {
 		return err
@@ -1251,6 +1720,8 @@ func (b *Mailbox) Send(draft Draft) error {
 		return err
 	}
 
+	var attachments []Attachment
+
 	for _, path := range draft.Attach {
 		content, err := os.ReadFile(path)
 
@@ -1263,6 +1734,8 @@ func (b *Mailbox) Send(draft Draft) error {
 		if contentType == "" {
 			contentType = "application/octet-stream"
 		}
+
+		attachments = append(attachments, Attachment{Name: filepath.Base(path), ContentType: contentType, Data: content})
 
 		var attachmentHeader mail.AttachmentHeader
 
@@ -1294,86 +1767,48 @@ func (b *Mailbox) Send(draft Draft) error {
 		return err
 	}
 
-	host, port, err := net.SplitHostPort(account.SMTP)
+	id := "outbox:" + messageID
 
-	if err != nil {
-		return fmt.Errorf("reading the smtp address: %w", err)
+	message := Message{
+		ID:           id,
+		Account:      account.Name,
+		Folder:       Outbox,
+		ServerFolder: Outbox,
+		From:         Address{Email: account.Email},
+		Subject:      draft.Subject,
+		Date:         now,
+		MessageID:    messageID,
+		Text:         plainText,
 	}
 
-	tlsConfig := &tls.Config{ServerName: host}
-	dialer := &net.Dialer{Timeout: 30 * time.Second}
-
-	var connection net.Conn
-
-	if port == "465" {
-		connection, err = tls.DialWithDialer(dialer, "tcp", account.SMTP, tlsConfig)
-	} else {
-		connection, err = dialer.Dial("tcp", account.SMTP)
-	}
-
-	if err != nil {
-		return fmt.Errorf("connecting to the smtp server: %w", err)
-	}
-
-	connection.SetDeadline(time.Now().Add(5 * time.Minute))
-
-	client, err := smtp.NewClient(connection, host)
-
-	if err != nil {
-		connection.Close()
-		return fmt.Errorf("connecting to the smtp server: %w", err)
-	}
-
-	defer client.Close()
-
-	if port != "465" {
-		err = client.StartTLS(tlsConfig)
-
-		if err != nil {
-			return fmt.Errorf("starting TLS: %w", err)
-		}
-	}
-
-	err = client.Auth(smtp.PlainAuth("", account.Email, opened.password, host))
-
-	if err != nil {
-		return fmt.Errorf("signing in: %w", err)
-	}
-
-	err = client.Mail(account.Email)
-
-	if err != nil {
-		return err
-	}
+	stored := storedBody{HTML: htmlText, Attachments: attachments, Raw: encoded.Bytes(), Draft: draft}
 
 	for _, recipient := range recipients {
-		err = client.Rcpt(recipient.Address)
-
-		if err != nil {
-			return fmt.Errorf("the server refused %s: %w", recipient.Address, err)
-		}
+		message.To = append(message.To, Address{Name: recipient.Name, Email: recipient.Address})
+		stored.Recipients = append(stored.Recipients, recipient.Address)
 	}
 
-	data, err := client.Data()
+	for _, attachment := range attachments {
+		message.Attachments = append(message.Attachments, Attachment{Name: attachment.Name, ContentType: attachment.ContentType})
+	}
+
+	var storedEncoded bytes.Buffer
+
+	err = gob.NewEncoder(&storedEncoded).Encode(stored)
 
 	if err != nil {
 		return err
 	}
 
-	_, err = data.Write(encoded.Bytes())
+	err = opened.mirror.Write(bodyFile(id), storedEncoded.Bytes())
 
 	if err != nil {
-		return err
+		return fmt.Errorf("saving to the outbox: %w", err)
 	}
 
-	err = data.Close()
+	b.mutex.Lock()
+	b.messages = append(b.messages, message)
+	b.mutex.Unlock()
 
-	if err != nil {
-		return err
-	}
-
-	// The server has accepted the email once DATA ends, so a failed QUIT must not report a failed send.
-	client.Quit()
-
-	return nil
+	return b.saveIndex(account.Name, opened)
 }

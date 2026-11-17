@@ -2,6 +2,7 @@ package mailbox
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -12,9 +13,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapserver"
+	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
 	"github.com/emersion/go-message/mail"
 )
 
@@ -26,6 +31,31 @@ func TestSend(t *testing.T) {
 	}
 
 	deliveries := make(chan delivery, 8)
+
+	var smtpPassword atomic.Value
+
+	memory := imapmemserver.New()
+	user := imapmemserver.NewUser("me@example.com", "secret")
+	memory.AddUser(user)
+	user.Create("INBOX", nil)
+
+	imapServer := imapserver.New(&imapserver.Options{
+		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+			return memory.NewSession(), nil, nil
+		},
+		Caps:      imap.CapSet{imap.CapIMAP4rev1: {}, imap.CapUIDPlus: {}, imap.CapMove: {}},
+		TLSConfig: serverTLS,
+		Logger:    discardLogger{},
+	})
+
+	imapListener, err := net.Listen("tcp", "127.0.0.1:0")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go imapServer.Serve(imapListener)
+	defer imapServer.Close()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 
@@ -73,7 +103,7 @@ func TestSend(t *testing.T) {
 					case "AUTH":
 						credentials, _ := base64.StdEncoding.DecodeString(strings.TrimPrefix(argument, "PLAIN "))
 
-						if string(credentials) != "\x00me@example.com\x00secret" {
+						if string(credentials) != "\x00me@example.com\x00"+smtpPassword.Load().(string) {
 							fmt.Fprint(current, "535 invalid credentials\r\n")
 							continue
 						}
@@ -119,15 +149,23 @@ func TestSend(t *testing.T) {
 	os.WriteFile(signaturePath, []byte("<p>Kit Hale<br>Hollow Lane Club</p>"), 0o600)
 	os.WriteFile(attachmentPath, []byte("Bring boots."), 0o600)
 
-	account := Account{Name: "Personal", Email: "me@example.com", SMTP: listener.Addr().String(), Signature: signaturePath}
+	account := Account{Name: "Personal", Email: "me@example.com", IMAP: imapListener.Addr().String(), SMTP: listener.Addr().String(), Signature: signaturePath, PasswordCommand: "echo secret"}
 
 	cases := []struct {
-		name     string
-		password string
-		draft    Draft
-		wantErr  string
-		want     []string
+		name         string
+		password     string
+		draft        Draft
+		wantQueueErr string
+		unqueue      bool
+		wantErr      string
+		want         []string
 	}{
+		{
+			name:     "returned to the draft before sending",
+			password: "secret",
+			draft:    Draft{Account: "Personal", To: "alex@example.com", Subject: "Re: Saturday walk?", Body: "Yes.", Attach: []string{attachmentPath}, ReplyTo: "original"},
+			unqueue:  true,
+		},
 		{
 			name:     "new email with markdown, signature and attachment",
 			password: "secret",
@@ -158,38 +196,94 @@ func TestSend(t *testing.T) {
 			},
 		},
 		{
-			name:     "wrong password",
-			password: "wrong",
+			name:     "smtp refuses the password",
+			password: "other",
 			draft:    Draft{Account: "Personal", To: "alex@example.com", Subject: "Hello", Body: "Hi."},
 			wantErr:  "535",
 		},
 		{
-			name:     "unreadable To line",
-			password: "secret",
-			draft:    Draft{Account: "Personal", To: "not an address", Subject: "Hello", Body: "Hi."},
-			wantErr:  "reading the To line",
+			name:         "unreadable To line",
+			password:     "secret",
+			draft:        Draft{Account: "Personal", To: "not an address", Subject: "Hello", Body: "Hi."},
+			wantQueueErr: "reading the To line",
 		},
 		{
-			name:     "missing attachment",
-			password: "secret",
-			draft:    Draft{Account: "Personal", To: "alex@example.com", Subject: "Hello", Body: "Hi.", Attach: []string{filepath.Join(directory, "gone.pdf")}},
-			wantErr:  "reading the attachment gone.pdf",
+			name:         "missing attachment",
+			password:     "secret",
+			draft:        Draft{Account: "Personal", To: "alex@example.com", Subject: "Hello", Body: "Hi.", Attach: []string{filepath.Join(directory, "gone.pdf")}},
+			wantQueueErr: "reading the attachment gone.pdf",
 		},
 	}
 
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			box := New([]Account{account}, t.TempDir(), 365)
-			box.opened[account.Name] = &openedAccount{password: test.password}
-			box.messages = []Message{{ID: "original", Account: account.Name, MessageID: "walk@example.com", References: []string{"plan@example.com"}}}
+			smtpPassword.Store(test.password)
 
-			err := box.Send(test.draft)
+			box := New([]Account{account}, t.TempDir(), 365)
+			box.Sync(context.Background(), account.Name, t.Logf)
+			box.messages = append(box.messages, Message{ID: "original", Account: account.Name, MessageID: "walk@example.com", References: []string{"plan@example.com"}})
+
+			err := box.Queue(test.draft)
 
 			switch {
-			case test.wantErr == "" && err != nil:
+			case test.wantQueueErr == "" && err != nil:
+				t.Fatalf("unexpected queue error: %v", err)
+
+			case test.wantQueueErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantQueueErr)):
+				t.Fatalf("got queue error %v, want one containing %q", err, test.wantQueueErr)
+
+			case test.wantQueueErr != "":
+				if len(box.Folder(account.Name, Outbox)) != 0 {
+					t.Fatal("a refused draft reached the outbox")
+				}
+
+				return
+			}
+
+			if len(box.Folder(account.Name, Outbox)) != 1 {
+				t.Fatal("the queued email isn't in the outbox")
+			}
+
+			if test.unqueue {
+				draft, err := box.Unqueue(box.Folder(account.Name, Outbox)[0].ID)
+
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if fmt.Sprint(draft) != fmt.Sprint(test.draft) {
+					t.Errorf("got draft %+v, want %+v", draft, test.draft)
+				}
+
+				box.Sync(context.Background(), account.Name, t.Logf)
+
+				select {
+				case <-deliveries:
+					t.Fatal("an email returned to the draft was sent")
+
+				default:
+				}
+
+				if len(box.Folder(account.Name, Outbox)) != 0 {
+					t.Fatal("an email returned to the draft stayed in the outbox")
+				}
+
+				return
+			}
+
+			err = box.Sync(context.Background(), account.Name, t.Logf)
+
+			if err == nil || !strings.Contains(err.Error(), "the server has no Sent folder") {
+				t.Fatalf("got sync error %v, want the missing Sent folder", err)
+			}
+
+			sendFailed := strings.Contains(err.Error(), "sending:")
+
+			switch {
+			case test.wantErr == "" && sendFailed:
 				t.Fatalf("unexpected error: %v", err)
 
-			case test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)):
+			case test.wantErr != "" && !strings.Contains(err.Error(), test.wantErr):
 				t.Fatalf("got error %v, want one containing %q", err, test.wantErr)
 
 			case test.wantErr != "":
@@ -200,7 +294,15 @@ func TestSend(t *testing.T) {
 				default:
 				}
 
+				if len(box.Folder(account.Name, Outbox)) != 1 {
+					t.Fatal("a failed send left the outbox")
+				}
+
 				return
+			}
+
+			if len(box.Folder(account.Name, Outbox)) != 0 {
+				t.Fatal("a sent email stayed in the outbox")
 			}
 
 			var received delivery

@@ -143,7 +143,7 @@ See you there.
 		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
 			return memory.NewSession(), nil, nil
 		},
-		Caps:      imap.CapSet{imap.CapIMAP4rev1: {}, imap.CapUIDPlus: {}, imap.CapMove: {}},
+		Caps:      imap.CapSet{imap.CapIMAP4rev1: {}, imap.CapUIDPlus: {}, imap.CapMove: {}, imap.CapIdle: {}},
 		TLSConfig: serverTLS,
 		Logger:    discardLogger{},
 	})
@@ -191,7 +191,7 @@ See you there.
 	}{
 		{
 			name:    "first sync",
-			action:  func() error { return mail.Sync(context.Background(), t.Logf) },
+			action:  func() error { return mail.Sync(context.Background(), "Personal", t.Logf) },
 			wantErr: "the server has no Sent folder",
 			check: func(t *testing.T) {
 				expected := map[string]string{
@@ -214,7 +214,7 @@ See you there.
 					t.Errorf("threading headers: got %q and %q", walk.MessageID, walk.References)
 				}
 
-				done, total := mail.SyncProgress()
+				done, total := mail.SyncProgress("Personal")
 
 				if done != 4 || total != 4 {
 					t.Errorf("progress: got %d of %d, want 4 of 4", done, total)
@@ -246,12 +246,12 @@ See you there.
 			name: "read locally reaches the server",
 			action: func() error {
 				mail.MarkRead(mail.Folder("Personal", Inbox)[0].ID)
-				return mail.Sync(context.Background(), t.Logf)
+				return mail.Sync(context.Background(), "Personal", t.Logf)
 			},
 			wantErr: "the server has no Sent folder",
 			check: func(t *testing.T) {
 				fresh := New([]Account{account}, t.TempDir(), 365)
-				fresh.Sync(context.Background(), t.Logf)
+				fresh.Sync(context.Background(), "Personal", t.Logf)
 
 				got := subjects(fresh, Inbox)
 
@@ -278,7 +278,7 @@ See you there.
 				client.Store(imap.SeqSetNum(2), &imap.StoreFlags{Op: imap.StoreFlagsAdd, Flags: []imap.Flag{imap.FlagDeleted}}, nil).Close()
 				client.Expunge().Close()
 
-				return mail.Sync(context.Background(), t.Logf)
+				return mail.Sync(context.Background(), "Personal", t.Logf)
 			},
 			wantErr: "the server has no Sent folder",
 			check: func(t *testing.T) {
@@ -308,7 +308,7 @@ Content-Type: text/plain
 Rent statement attached.
 `)
 
-				mail.Sync(context.Background(), t.Logf)
+				mail.Sync(context.Background(), "Personal", t.Logf)
 
 				quarterly := mail.Folder("Personal", Inbox)[1]
 
@@ -334,12 +334,12 @@ Rent statement attached.
 					t.Errorf("restarted mailbox opened before sync: %q", got)
 				}
 
-				return mail.Sync(context.Background(), report)
+				return mail.Sync(context.Background(), "Personal", report)
 			},
 			wantErr: "the server has no Sent folder",
 			check: func(t *testing.T) {
 				fresh := New([]Account{account}, t.TempDir(), 365)
-				fresh.Sync(context.Background(), t.Logf)
+				fresh.Sync(context.Background(), "Personal", t.Logf)
 
 				for _, box := range []*Mailbox{mail, fresh} {
 					inbox := subjects(box, Inbox)
@@ -356,7 +356,7 @@ Rent statement attached.
 					t.Errorf("load: %v %q", err, loaded.Text)
 				}
 
-				if !slices.Contains(reports, "Personal Inbox: moved 1, dropped 0 already moved or deleted elsewhere") {
+				if !slices.Contains(reports, "Inbox: moved 1, dropped 0 already moved or deleted elsewhere") {
 					t.Errorf("reports: %q", reports)
 				}
 			},
@@ -385,7 +385,7 @@ Rent statement attached.
 
 				reports = nil
 
-				return mail.Sync(context.Background(), report)
+				return mail.Sync(context.Background(), "Personal", report)
 			},
 			wantErr: "the server has no Sent folder",
 			check: func(t *testing.T) {
@@ -396,9 +396,40 @@ Rent statement attached.
 					t.Errorf("got inbox %q and events %q", inbox, events)
 				}
 
-				if !slices.Contains(reports, "Personal Inbox: moved 0, dropped 1 already moved or deleted elsewhere") {
+				if !slices.Contains(reports, "Inbox: moved 0, dropped 1 already moved or deleted elsewhere") {
 					t.Errorf("reports: %q", reports)
 				}
+			},
+		},
+		{
+			name: "inbox watch wakes on new mail",
+			action: func() error {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+
+				waiting := make(chan struct{}, 1)
+				watched := make(chan error, 1)
+
+				watchReport := func(format string, arguments ...any) {
+					if strings.Contains(format, "waiting") {
+						waiting <- struct{}{}
+					}
+				}
+
+				go func() { watched <- mail.WatchInbox(ctx, "Personal", watchReport) }()
+
+				select {
+				case <-waiting:
+
+				case err := <-watched:
+					return err
+				}
+
+				time.Sleep(100 * time.Millisecond)
+
+				appendMessage("INBOX", now, nil, "From: Alex Moreno <alex@example.com>\nSubject: One more thing\n\nBring a torch.\n")
+
+				return <-watched
 			},
 		},
 		{
@@ -407,7 +438,7 @@ Rent statement attached.
 				server.Close()
 
 				restarted := New([]Account{account}, mirrorDirectory, 365)
-				err := restarted.Sync(context.Background(), t.Logf)
+				err := restarted.Sync(context.Background(), "Personal", t.Logf)
 
 				mail = restarted
 
@@ -434,7 +465,7 @@ Rent statement attached.
 				locked := account
 				locked.PasswordCommand = "false"
 
-				return New([]Account{locked}, t.TempDir(), 365).Sync(context.Background(), t.Logf)
+				return New([]Account{locked}, t.TempDir(), 365).Sync(context.Background(), "Personal", t.Logf)
 			},
 			wantErr: "couldn't get the password",
 		},

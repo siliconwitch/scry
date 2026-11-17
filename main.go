@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -35,6 +36,7 @@ type accountConfig struct {
 	Signature       string   `toml:"signature"`
 	PasswordCommand string   `toml:"password-cmd"`
 	Folders         []string `toml:"folders"`
+	CombinedInbox   *bool    `toml:"combined-inbox"`
 }
 
 func main() {
@@ -87,6 +89,11 @@ func main() {
 
 		accountByEmail[email] = account.Name
 
+		if slices.Contains(account.Folders, mailbox.Outbox) {
+			fmt.Fprintf(os.Stderr, "scry: %s lists an %s folder, but scry keeps that name for unsent email. Remove it from folders.\n", account.Name, mailbox.Outbox)
+			os.Exit(1)
+		}
+
 		signature := account.Signature
 		rest, inHome := strings.CutPrefix(signature, "~/")
 
@@ -94,7 +101,7 @@ func main() {
 			signature = filepath.Join(home, rest)
 		}
 
-		accounts = append(accounts, mailbox.Account{Name: account.Name, Email: account.Email, IMAP: account.IMAP, SMTP: account.SMTP, Signature: signature, PasswordCommand: account.PasswordCommand, Folders: account.Folders})
+		accounts = append(accounts, mailbox.Account{Name: account.Name, Email: account.Email, IMAP: account.IMAP, SMTP: account.SMTP, Signature: signature, PasswordCommand: account.PasswordCommand, Folders: account.Folders, HideFromCombinedInbox: account.CombinedInbox != nil && !*account.CombinedInbox})
 	}
 
 	stateDirectory := os.Getenv("XDG_STATE_HOME")
