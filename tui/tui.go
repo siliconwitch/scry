@@ -1599,7 +1599,7 @@ func (m *Model) View() tea.View {
 		}
 
 		count := ""
-		if m.unreadCounts[i] > 0 {
+		if m.unreadCounts[i] > 0 && (row.folder != mailbox.Spam || i == m.folderIndex) {
 			count = strconv.Itoa(m.unreadCounts[i])
 		}
 

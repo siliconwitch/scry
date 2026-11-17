@@ -58,7 +58,7 @@ Everything you can see and do in scry. Anything not listed here is out.
   hidden when empty.
 - The number keys along the top of the keyboard jump to each account's Inbox.
   1 jumps to the first account's Inbox, 2 to the second, and so on up to 9.
-- Each folder shows its unread count.
+- Each folder shows its unread count. Spam shows its count only while selected.
 - Each account has its own colour, set by its order in the config. The colour
   marks the account everywhere: the sidebar, the email list, the draft, the
   sync log and the viewer.
