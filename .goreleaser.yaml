@@ -1,0 +1,77 @@
+version: 2
+
+project_name: scry
+
+env:
+  - CGO_ENABLED=0
+
+before:
+  hooks:
+    - go mod verify
+    - go vet ./...
+    - go test ./...
+
+builds:
+  - id: scry
+    main: .
+    binary: scry
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: scry
+    ids:
+      - scry
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+      - config.example.toml
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  disable: true
+
+release:
+  github:
+    owner: siliconwitch
+    name: scry
+  mode: keep-existing
+  prerelease: auto
+
+aurs:
+  - name: scry-bin
+    ids:
+      - scry
+    homepage: https://github.com/siliconwitch/scry
+    description: A terminal email client with a browser viewer
+    license: MIT
+    maintainers:
+      - Raj Nakarja <raj@siliconwitchery.com>
+    private_key: "{{ .Env.AUR_KEY }}"
+    git_url: ssh://aur@aur.archlinux.org/scry-bin.git
+    provides:
+      - scry
+    conflicts:
+      - scry
+    skip_upload: auto
+    commit_author:
+      name: Raj Nakarja
+      email: raj@siliconwitchery.com
+    package: |-
+      install -Dm755 "./scry" "${pkgdir}/usr/bin/scry"
+      install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+      install -Dm644 "./README.md" "${pkgdir}/usr/share/doc/scry/README.md"
+      install -Dm644 "./config.example.toml" "${pkgdir}/usr/share/doc/scry/config.example.toml"

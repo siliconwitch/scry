@@ -18,6 +18,8 @@ import (
 	"github.com/siliconwitch/scry/viewer"
 )
 
+const version = "0.1.0"
+
 type config struct {
 	Viewer      string          `toml:"viewer"`
 	LogDays     int             `toml:"log-days"`

@@ -1,0 +1,52 @@
+name: flake
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/flake.yml
+      - flake.lock
+      - flake.nix
+      - go.mod
+      - go.sum
+      - main.go
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flake-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  flake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build the package the flake defines
+        run: nix build --print-build-logs .#scry
+
+      - name: Verify the flake agrees with main.go
+        run: |
+          declared=$(sed -n 's/^const version = "\(.*\)"$/\1/p' main.go)
+
+          if [ -z "$declared" ]; then
+            echo "could not read 'const version' from main.go"
+            exit 1
+          fi
+
+          evaluated=$(nix eval --raw .#scry.version)
+
+          if [ "$evaluated" != "$declared" ]; then
+            echo "main.go declares $declared, but flake.nix reads $evaluated"
+            exit 1
+          fi

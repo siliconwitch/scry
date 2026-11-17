@@ -1,0 +1,69 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.repository == 'siliconwitch/scry'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Verify the tag is on main
+        run: |
+          git fetch --no-tags origin main
+
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "$GITHUB_REF_NAME points at a commit that is not on main"
+            exit 1
+          fi
+
+      - name: Verify the tag matches the version in main.go
+        run: |
+          declared=$(sed -n 's/^const version = "\(.*\)"$/\1/p' main.go)
+          tagged="${GITHUB_REF_NAME#v}"
+
+          if [ -z "$declared" ]; then
+            echo "could not read 'const version' from main.go"
+            exit 1
+          fi
+
+          if [ "$declared" != "$tagged" ]; then
+            echo "tag $GITHUB_REF_NAME implies $tagged, but main.go declares $declared"
+            exit 1
+          fi
+
+      - name: Verify the AUR key is present
+        env:
+          AUR_KEY: ${{ secrets.AUR_KEY }}
+        run: |
+          if [ -z "$AUR_KEY" ]; then
+            echo "AUR_KEY is unset, and GoReleaser would skip the AUR upload without failing"
+            exit 1
+          fi
+
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUR_KEY: ${{ secrets.AUR_KEY }}
