@@ -47,6 +47,8 @@ Everything you can see and do in scry. Anything not listed here is out.
 
 - scry works with any number of IMAP accounts, including Gmail.
 - The sidebar starts with one Inbox that shows mail from every account.
+- An account with `combined-inbox = false` in its config stays out of that
+  Inbox. Its mail still shows in its own Inbox.
 - Below it, each account shows Inbox, Sent, Archive, Spam and Trash, plus the
   folders the config lists for it, such as `Events` and `Reference`. Other
   folders on the server, including Drafts, stay hidden.

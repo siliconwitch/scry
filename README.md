@@ -129,6 +129,7 @@ colour and its number key, so `1` jumps to the first account's Inbox.
 | `password-cmd` | Command that prints the account's password                              |
 | `signature`    | Optional HTML file appended to every email you send                     |
 | `folders`      | Optional server folders to show beside Inbox, Sent, Archive, Spam and Trash |
+| `combined-inbox` | Optional. Set to `false` to keep the account out of the combined Inbox. Its mail still shows in its own Inbox. |
 
 Gmail needs an [app password](https://myaccount.google.com/apppasswords), not
 your account password.
