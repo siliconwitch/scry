@@ -1758,8 +1758,25 @@ func (b *Mailbox) Queue(draft Draft) error {
 	var rendered strings.Builder
 
 	block := ""
+	depth := 0
 
 	for _, line := range strings.Split(draft.Body, "\n") {
+		quoteDepth := 0
+
+		for strings.HasPrefix(line, ">") {
+			line = strings.TrimPrefix(line[1:], " ")
+			quoteDepth++
+		}
+
+		if quoteDepth != depth && block != "" {
+			rendered.WriteString("</" + block + ">")
+			block = ""
+		}
+
+		rendered.WriteString(strings.Repeat("</blockquote>", max(depth-quoteDepth, 0)))
+		rendered.WriteString(strings.Repeat(`<blockquote style="margin:0 0 0 0.8ex;border-left:1px solid #ccc;padding-left:1ex">`, max(quoteDepth-depth, 0)))
+		depth = quoteDepth
+
 		item, isItem := strings.CutPrefix(line, "- ")
 
 		kind := "p"
@@ -1824,6 +1841,8 @@ func (b *Mailbox) Queue(draft Draft) error {
 	if block != "" {
 		rendered.WriteString("</" + block + ">")
 	}
+
+	rendered.WriteString(strings.Repeat("</blockquote>", depth))
 
 	plainText := draft.Body
 	htmlText := rendered.String()

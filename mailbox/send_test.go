@@ -206,8 +206,9 @@ func TestSend(t *testing.T) {
 		{
 			name:     "reply threads under the original",
 			password: "secret",
-			draft:    Draft{Account: "Personal", To: "alex@example.com", Subject: "Re: Saturday walk?", Body: "Yes.", ReplyTo: "original"},
+			draft:    Draft{Account: "Personal", To: "alex@example.com", Subject: "Re: Saturday walk?", Body: "Yes.\n\nAlex wrote:\n> Saturday?\n> - boots\n>\n> > Kit wrote:\n>> Walk?\nKit", ReplyTo: "original"},
 			want: []string{
+				"text/html: <p>Yes.</p><p>Alex wrote:</p><blockquote style=\"margin:0 0 0 0.8ex;border-left:1px solid #ccc;padding-left:1ex\"><p>Saturday?</p><ul><li>boots</li></ul><blockquote style=\"margin:0 0 0 0.8ex;border-left:1px solid #ccc;padding-left:1ex\"><p>Kit wrote:<br>Walk?</p></blockquote></blockquote><p>Kit</p>",
 				"in-reply-to <walk@example.com>\n",
 				"references <plan@example.com> <walk@example.com>\n",
 				"copies in Sent 1, with bcc \n",
