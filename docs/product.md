@@ -82,10 +82,20 @@ Everything you can see and do in scry. Anything not listed here is out.
 - The config can name a browser command that opens the viewer at startup, such
   as `chromium --app=%s`. The sync log view shows the viewer's address for any
   browser.
+- The viewer window closes when scry quits.
 - The viewer header shows the sender and the To, Cc and Bcc recipients. Bcc
   shows when the email carries one, which is normally only email you sent.
   Clicking a name or address copies it.
-- The viewer lists attachments. Clicking one downloads it.
+- The viewer lists attachments. Clicking an image or PDF shows it in place of
+  the email. Clicking any other attachment downloads it.
+- While an attachment shows, the viewer's top bar has arrows to step through
+  the email's images and PDFs, a download button and a button back to the
+  email.
+- In a PDF you can select and copy text. Its links open with `links`, and a
+  link to another page scrolls there.
+- Clicking a link in an email opens it with the browser command that `links`
+  names in the config, such as `firefox %s`. Only `http` and `https` links
+  open.
 - `y` copies the sender's address.
 
 ### Organising
@@ -93,9 +103,13 @@ Everything you can see and do in scry. Anything not listed here is out.
 - `A` archives an email to its account's Archive folder.
 - `M` moves an email to one of its account's folders. The list leaves out the
   current folder, Sent, Spam and Trash.
-- `!` moves an email to its account's Spam folder.
+- `!` moves an email to its account's Spam folder. In Spam, `!` moves it back
+  to the Inbox.
 - `D` moves an email to its account's Trash folder. Deleting from Spam does the
   same.
+- `E` in an account's Trash deletes every email in it for good, after asking.
+  It deletes only the emails scry has downloaded, so email that reaches Trash
+  on the server after the last sync stays.
 - An email in the Outbox can't be archived, moved or marked as spam.
 
 ### Searching
@@ -156,8 +170,10 @@ Everything you can see and do in scry. Anything not listed here is out.
 
 ### Keyboard and mouse
 
-- Every action has a keybind and a mouse equivalent. The footer shows the keys
-  for the current view as buttons.
+- Every action in the terminal has a keybind and a mouse equivalent. The
+  viewer is mouse only.
+- The footer shows, as buttons, every key that works in the current view, and
+  no others. It wraps onto more rows when the window is narrow.
 - `j` and `k`, Up and Down, Page Up, Page Down, Home and End move through a
   list.
 - Tab switches between the sidebar and the email list. `h` or Left focuses
@@ -166,7 +182,7 @@ Everything you can see and do in scry. Anything not listed here is out.
 - Clicking an email selects it and shows it in the viewer. Clicking a folder,
   button or icon runs it.
 - The mouse wheel scrolls lists.
-- `q` quits.
+- `q` quits. Ctrl+C quits from anywhere, including while typing a search.
 
 ## Strict behaviour list
 
@@ -184,8 +200,9 @@ Everything scry does that you don't see or drive directly.
 - When an account's password changes, scry deletes that account's mirror and
   downloads it again from the server. The account's Outbox and any changes
   waiting for a sync are lost, because only the mirror holds them.
-- Reading, archive, move, spam and delete work offline. scry applies them to
-  the local mirror at once and starts a sync to send them to the server.
+- Reading, archive, move, spam, delete and emptying Trash work offline. scry
+  applies them to the local mirror at once and starts a sync to send them to
+  the server.
   Without a connection, they wait and go out once the connection returns.
 - Before applying a queued action, scry checks the email's current state on
   the server. If another client already moved or deleted the email, scry drops
@@ -202,14 +219,19 @@ Everything scry does that you don't see or drive directly.
 - A remote image means an `<img>` source or a `background` attribute with an
   `http://` or `https://` address. Images set any other way, such as in CSS,
   stay blank.
-- scry fetches nothing for Spam, so spammers can't confirm your address is
-  live. Images in Spam stay blank.
+- scry fetches nothing for Spam or Trash, so spammers can't confirm your
+  address is live. Images in Spam and Trash stay blank.
+- An email moved out of Spam or Trash into another folder gets its images at
+  the next sync.
 - scry never fetches an image from a private or local network address.
 - scry never sends read receipts.
 - Only this machine can reach the viewer, and its address includes a secret
   token.
 - Scripts in email never run. The viewer shows images from the mirror and
   never contacts the network.
+- The viewer never opens a link itself. Links go to the `links` browser.
+- PDFs render with a copy of pdf.js built into scry. Scripts in a PDF never
+  run.
 
 ### Passwords
 
@@ -222,11 +244,12 @@ Everything scry does that you don't see or drive directly.
 ### Sync
 
 - Every sync works the same way. It sends the Outbox, applies your moves,
-  pushes your reads, then fetches new mail and changes made in other clients.
+  empties Trash, pushes your reads, then fetches new mail and changes made in
+  other clients.
 - Each account syncs on its own, so a slow or offline account never holds up
   the others.
 - scry syncs when it opens, after you read, archive, move, spam, delete or send
-  an email, and every 10 minutes.
+  an email, after you empty Trash, and every 10 minutes.
 - scry keeps a connection open to each account's Inbox. The server reports new
   mail and changes from other clients on it, and scry syncs at once.
 - When that connection drops, scry reconnects and syncs after 10 seconds,
@@ -269,6 +292,7 @@ Everything scry does that you don't see or drive directly.
 
 ```toml
 viewer = "chromium --app=%s"
+links = "firefox %s"
 log-days = 7
 history-days = 365
 

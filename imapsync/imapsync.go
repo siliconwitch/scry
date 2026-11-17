@@ -317,6 +317,32 @@ func (s *Session) Move(uids []uint32, destination string) (map[uint32]uint32, er
 	return moved, nil
 }
 
+func (s *Session) Delete(uids []uint32) error {
+	// Without UIDPLUS only a plain EXPUNGE exists, which also removes email other clients flagged as deleted.
+	if !s.client.Caps().Has(imap.CapUIDPlus) {
+		return errors.New("the server doesn't support UIDPLUS, which deleting needs")
+	}
+
+	s.conn.watch(true)
+	defer s.conn.watch(false)
+
+	for batch := range slices.Chunk(uids, 500) {
+		err := s.client.Store(uidSet(batch), &imap.StoreFlags{Op: imap.StoreFlagsAdd, Silent: true, Flags: []imap.Flag{imap.FlagDeleted}}, nil).Close()
+
+		if err != nil {
+			return err
+		}
+
+		err = s.client.UIDExpunge(uidSet(batch)).Close()
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (s *Session) AppendSeen(folder string, content []byte) error {
 	s.conn.watch(true)
 	defer s.conn.watch(false)

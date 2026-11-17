@@ -10,7 +10,7 @@ window beside it.
   search work offline.
 - Configured in one text file that can live in your dotfiles.
 - Every remote image downloads at sync, so tracking pixels can't tell when you
-  read an email. Scripts never run, and nothing loads for Spam.
+  read an email. Scripts never run, and nothing loads for Spam or Trash.
 - Write in `$EDITOR` with `**bold**` and `-` bullet lists. scry sends plain
   text and HTML versions of each email.
 
@@ -86,6 +86,7 @@ packages install a copy under `share/doc/scry/`.
 
 ```toml
 viewer = "chromium --app=%s"
+links = "firefox %s"
 
 [[account]]
 name = "Personal"
@@ -109,11 +110,16 @@ folders = ["Events", "Reference"]
 | Setting        | Default | Purpose                                                                 |
 | -------------- | ------- | ----------------------------------------------------------------------- |
 | `viewer`       |         | Browser command that opens the viewer. `%s` is the viewer's address.    |
+| `links`        |         | Browser command that opens a link clicked in an email. `%s` is the link. |
 | `log-days`     | `7`     | Days to keep sync logs                                                  |
 | `history-days` | `365`   | Days of Archive and Sent to keep on this machine. Older mail stays on the server. |
 
 Leave out `viewer` and press `L` in scry to see the viewer's address. Open it
 in any browser.
+
+The viewer never opens links itself, so it never reaches the network. Set
+`links` to send them to another browser. `firefox %s` opens each link as a tab
+in a running Firefox, or in a new window.
 
 ### Accounts
 

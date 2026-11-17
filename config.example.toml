@@ -4,6 +4,10 @@
 # address. Leave it out and scry shows the address to open yourself.
 viewer = "chromium --app=%s"
 
+# Browser command that opens a link clicked in an email. %s is the link. The
+# viewer never opens links itself. Leave it out and links do nothing.
+links = "firefox %s"
+
 # Days to keep sync logs in ~/.local/state/scry/logs.
 log-days = 7
 

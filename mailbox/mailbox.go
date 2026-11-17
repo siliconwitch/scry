@@ -45,6 +45,8 @@ const (
 	Outbox  = "Outbox"
 )
 
+const deleted = "" // the Folder of an email waiting for a sync to delete it from the server's Trash
+
 var ErrAlreadyThere = errors.New("already in that folder")
 
 var ErrInOutbox = errors.New("an email in the Outbox can't move until it is sent")
@@ -217,7 +219,7 @@ func (b *Mailbox) All() []Message {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
-	return slices.Clone(b.messages)
+	return slices.DeleteFunc(slices.Clone(b.messages), func(m Message) bool { return m.Folder == deleted })
 }
 
 func (b *Mailbox) Get(id string) (Message, bool) {
@@ -334,6 +336,26 @@ func (b *Mailbox) MarkRead(id string) {
 			b.opened[b.messages[i].Account].changed = true
 		}
 	}
+}
+
+func (b *Mailbox) EmptyTrash(account string) int {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	count := 0
+
+	for i := range b.messages {
+		if b.messages[i].Account == account && b.messages[i].Folder == Trash {
+			b.messages[i].Folder = deleted
+			count++
+		}
+	}
+
+	if count > 0 {
+		b.opened[account].changed = true
+	}
+
+	return count
 }
 
 func (b *Mailbox) Save() error {
@@ -779,12 +801,47 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 		report("Outbox: saved a copy to Sent")
 	}
 
+	carrierGradeNAT := netip.MustParsePrefix("100.64.0.0/10")
+
+	imageClient := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			Proxy: nil,
+			DialContext: (&net.Dialer{
+				Timeout: 10 * time.Second,
+				Control: func(network, address string, _ syscall.RawConn) error {
+					host, _, err := net.SplitHostPort(address)
+
+					if err != nil {
+						return err
+					}
+
+					ip, err := netip.ParseAddr(host)
+
+					if err != nil {
+						return err
+					}
+
+					ip = ip.Unmap()
+
+					if !ip.IsGlobalUnicast() || ip.IsPrivate() || carrierGradeNAT.Contains(ip) {
+						return errPrivateAddress
+					}
+
+					return nil
+				},
+			}).DialContext,
+			ForceAttemptHTTP2:   true,
+			MaxIdleConnsPerHost: 4,
+		},
+	}
+
 	pendingMoves := map[string][]Message{}
 
 	b.mutex.Lock()
 
 	for _, message := range b.messages {
-		if message.Account == account.Name && message.Folder != message.ServerFolder {
+		if message.Account == account.Name && message.Folder != message.ServerFolder && !(message.Folder == deleted && message.ServerFolder == Trash) {
 			pendingMoves[message.ServerFolder] = append(pendingMoves[message.ServerFolder], message)
 		}
 	}
@@ -848,7 +905,13 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 				continue
 			}
 
-			byDestination[message.Folder] = append(byDestination[message.Folder], message.UID)
+			destination := message.Folder
+
+			if destination == deleted {
+				destination = Trash
+			}
+
+			byDestination[destination] = append(byDestination[destination], message.UID)
 		}
 
 		b.mutex.Lock()
@@ -866,6 +929,7 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 		}
 
 		movedCount := 0
+		var leftBlankFolders []string
 
 		for _, destination := range account.Folders {
 			destinationUIDs := byDestination[destination]
@@ -899,6 +963,10 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 				if ok && message.Account == account.Name && message.ServerFolder == source {
 					b.messages[i].ServerFolder = destination
 					b.messages[i].UID = newUID
+
+					if (source == Spam || source == Trash) && destination != Spam && destination != Trash {
+						leftBlankFolders = append(leftBlankFolders, message.ID)
+					}
 				}
 			}
 
@@ -908,6 +976,132 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 		}
 
 		report("%s: moved %d, dropped %d already moved or deleted elsewhere", source, movedCount, len(dropped))
+
+		imageOutcomes := map[string]int{}
+
+		for _, id := range leftBlankFolders {
+			content, err := opened.mirror.Read(bodyFile(id))
+
+			var stored storedBody
+
+			if err == nil {
+				err = gob.NewDecoder(bytes.NewReader(content)).Decode(&stored)
+			}
+
+			if err != nil {
+				report("%s: reading an email moved out of %s failed: %v", source, source, err)
+				failures = append(failures, fmt.Errorf("reading an email moved out of %s: %w", source, err))
+				continue
+			}
+
+			if stored.HTML == "" {
+				continue
+			}
+
+			stored.HTML = fetchImages(ctx, imageClient, stored.HTML, func(outcome string) { imageOutcomes[outcome]++ })
+
+			var encoded bytes.Buffer
+
+			err = gob.NewEncoder(&encoded).Encode(stored)
+
+			if err == nil {
+				err = opened.mirror.Write(bodyFile(id), encoded.Bytes())
+			}
+
+			if err != nil {
+				report("%s: saving the images of an email moved out of %s failed: %v", source, source, err)
+				failures = append(failures, fmt.Errorf("saving an email moved out of %s: %w", source, err))
+			}
+		}
+
+		if len(imageOutcomes) > 0 {
+			report("%s: remote images in %d emails moved out: %s", source, len(leftBlankFolders), imageReport(imageOutcomes))
+		}
+	}
+
+	var deleteIDs []string
+	var deleteUIDs []uint32
+
+	b.mutex.Lock()
+
+	for _, message := range b.messages {
+		if message.Account == account.Name && message.Folder == deleted && message.ServerFolder == Trash {
+			deleteIDs = append(deleteIDs, message.ID)
+			deleteUIDs = append(deleteUIDs, message.UID)
+		}
+	}
+
+	b.mutex.Unlock()
+
+	switch {
+	case len(deleteIDs) == 0:
+		report("Trash: nothing to delete")
+
+	case servers[Trash] == "":
+		report("Trash: %d deletions wait, because the server has no Trash folder", len(deleteIDs))
+
+	default:
+		err := func() error {
+			uidValidity, err := session.Select(servers[Trash])
+
+			if err != nil {
+				return fmt.Errorf("opening Trash to delete %d emails: %w", len(deleteIDs), err)
+			}
+
+			present := map[uint32]bool{}
+			known := opened.folders[Trash]
+
+			if known.Server == servers[Trash] && known.UIDValidity == uidValidity {
+				present, err = session.Seen(deleteUIDs)
+
+				if err != nil {
+					return fmt.Errorf("checking %d emails to delete in Trash: %w", len(deleteIDs), err)
+				}
+			} else {
+				report("Trash: the folder was rebuilt on the server, so its %d deletions can't be matched", len(deleteIDs))
+			}
+
+			var presentUIDs []uint32
+
+			for _, uid := range deleteUIDs {
+				_, onServer := present[uid]
+
+				if onServer {
+					presentUIDs = append(presentUIDs, uid)
+				}
+			}
+
+			if len(presentUIDs) > 0 {
+				err = session.Delete(presentUIDs)
+
+				if err != nil {
+					return fmt.Errorf("deleting %d emails from Trash: %w", len(presentUIDs), err)
+				}
+			}
+
+			b.mutex.Lock()
+
+			b.messages = slices.DeleteFunc(b.messages, func(m Message) bool { return slices.Contains(deleteIDs, m.ID) })
+
+			for _, id := range deleteIDs {
+				delete(b.pendingSeen, id)
+			}
+
+			b.mutex.Unlock()
+
+			for _, id := range deleteIDs {
+				opened.mirror.Remove(bodyFile(id))
+			}
+
+			report("Trash: deleted %d for good, dropped %d already deleted elsewhere", len(presentUIDs), len(deleteIDs)-len(presentUIDs))
+
+			return nil
+		}()
+
+		if err != nil {
+			report("Trash: %v", err)
+			failures = append(failures, err)
+		}
 	}
 
 	pushedReads := 0
@@ -1184,42 +1378,6 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 		report("Downloads: nothing new")
 	}
 
-	carrierGradeNAT := netip.MustParsePrefix("100.64.0.0/10")
-	errPrivateAddress := errors.New("refusing to fetch an image from a private address")
-
-	imageClient := &http.Client{
-		Timeout: 15 * time.Second,
-		Transport: &http.Transport{
-			Proxy: nil,
-			DialContext: (&net.Dialer{
-				Timeout: 10 * time.Second,
-				Control: func(network, address string, _ syscall.RawConn) error {
-					host, _, err := net.SplitHostPort(address)
-
-					if err != nil {
-						return err
-					}
-
-					ip, err := netip.ParseAddr(host)
-
-					if err != nil {
-						return err
-					}
-
-					ip = ip.Unmap()
-
-					if !ip.IsGlobalUnicast() || ip.IsPrivate() || carrierGradeNAT.Contains(ip) {
-						return errPrivateAddress
-					}
-
-					return nil
-				},
-			}).DialContext,
-			ForceAttemptHTTP2:   true,
-			MaxIdleConnsPerHost: 4,
-		},
-	}
-
 	lastSaved := time.Now()
 
 	for _, planned := range planned {
@@ -1273,105 +1431,14 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 				group.Go(func() error {
 					body := fetched.HTML
 
-					if folder == Spam && body != "" {
-						countImage("skipped in Spam")
-					}
+					switch {
+					case body == "":
 
-					if folder != Spam && body != "" {
-						document, err := html.Parse(strings.NewReader(body))
+					case folder == Spam || folder == Trash:
+						countImage("skipped in " + folder)
 
-						if err != nil {
-							countImage("skipped in unreadable HTML")
-						}
-
-						if err == nil {
-							downloaded := map[string]string{}
-
-							for node := range document.Descendants() {
-								if node.Type != html.ElementNode {
-									continue
-								}
-
-								node.Attr = slices.DeleteFunc(node.Attr, func(attribute html.Attribute) bool { return attribute.Key == "srcset" })
-
-								for a, attribute := range node.Attr {
-									isImage := (node.Data == "img" && attribute.Key == "src") || attribute.Key == "background"
-
-									if !isImage || !(strings.HasPrefix(attribute.Val, "https://") || strings.HasPrefix(attribute.Val, "http://")) {
-										continue
-									}
-
-									_, done := downloaded[attribute.Val]
-
-									if !done {
-										downloaded[attribute.Val] = ""
-
-										request, err := http.NewRequestWithContext(groupCtx, http.MethodGet, attribute.Val, nil)
-
-										if err != nil {
-											countImage("unusable address")
-											continue
-										}
-
-										response, err := imageClient.Do(request)
-
-										if errors.Is(err, errPrivateAddress) {
-											countImage("refused private address")
-											continue
-										}
-
-										if err != nil {
-											countImage("unreachable")
-											continue
-										}
-
-										image, err := io.ReadAll(io.LimitReader(response.Body, 5<<20+1))
-										response.Body.Close()
-
-										switch {
-										case err != nil:
-											countImage("interrupted")
-											continue
-
-										case response.StatusCode != http.StatusOK:
-											countImage("refused by the image server")
-											continue
-
-										case len(image) > 5<<20:
-											countImage("over 5 MB")
-											continue
-										}
-
-										contentType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
-
-										if !strings.HasPrefix(contentType, "image/") {
-											contentType = http.DetectContentType(image)
-										}
-
-										if !strings.HasPrefix(contentType, "image/") {
-											countImage("not an image")
-											continue
-										}
-
-										countImage("saved")
-
-										downloaded[attribute.Val] = "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(image)
-									}
-
-									if downloaded[attribute.Val] != "" {
-										node.Attr[a].Val = downloaded[attribute.Val]
-									}
-								}
-							}
-
-							var rendered strings.Builder
-
-							err = html.Render(&rendered, document)
-
-							if err == nil {
-								body = rendered.String()
-							}
-						}
+					default:
+						body = fetchImages(groupCtx, imageClient, body, countImage)
 					}
 
 					id := fmt.Sprintf("%s:%s:%d:%d", account.Email, folder, uidValidity, fetched.UID)
@@ -1447,15 +1514,7 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 			report("%s: saved %d emails, %d of %d this sync", folder, len(messages), count.done, count.total)
 
 			if len(imageOutcomes) > 0 {
-				var outcomes []string
-
-				for outcome, number := range imageOutcomes {
-					outcomes = append(outcomes, fmt.Sprintf("%d %s", number, outcome))
-				}
-
-				slices.Sort(outcomes)
-
-				report("%s: remote images: %s", folder, strings.Join(outcomes, ", "))
+				report("%s: remote images: %s", folder, imageReport(imageOutcomes))
 			}
 
 			if time.Since(lastSaved) < 30*time.Second {
@@ -1938,4 +1997,116 @@ func (b *Mailbox) Queue(draft Draft) error {
 	b.mutex.Unlock()
 
 	return b.saveIndex(account.Name, opened)
+}
+
+var errPrivateAddress = errors.New("refusing to fetch an image from a private address")
+
+func fetchImages(ctx context.Context, client *http.Client, body string, countImage func(outcome string)) string {
+	document, err := html.Parse(strings.NewReader(body))
+
+	if err != nil {
+		countImage("skipped in unreadable HTML")
+		return body
+	}
+
+	downloaded := map[string]string{}
+
+	for node := range document.Descendants() {
+		if node.Type != html.ElementNode {
+			continue
+		}
+
+		node.Attr = slices.DeleteFunc(node.Attr, func(attribute html.Attribute) bool { return attribute.Key == "srcset" })
+
+		for a, attribute := range node.Attr {
+			isImage := (node.Data == "img" && attribute.Key == "src") || attribute.Key == "background"
+
+			if !isImage || !(strings.HasPrefix(attribute.Val, "https://") || strings.HasPrefix(attribute.Val, "http://")) {
+				continue
+			}
+
+			_, done := downloaded[attribute.Val]
+
+			if !done {
+				downloaded[attribute.Val] = ""
+
+				request, err := http.NewRequestWithContext(ctx, http.MethodGet, attribute.Val, nil)
+
+				if err != nil {
+					countImage("unusable address")
+					continue
+				}
+
+				response, err := client.Do(request)
+
+				if errors.Is(err, errPrivateAddress) {
+					countImage("refused private address")
+					continue
+				}
+
+				if err != nil {
+					countImage("unreachable")
+					continue
+				}
+
+				image, err := io.ReadAll(io.LimitReader(response.Body, 5<<20+1))
+				response.Body.Close()
+
+				switch {
+				case err != nil:
+					countImage("interrupted")
+					continue
+
+				case response.StatusCode != http.StatusOK:
+					countImage("refused by the image server")
+					continue
+
+				case len(image) > 5<<20:
+					countImage("over 5 MB")
+					continue
+				}
+
+				contentType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
+
+				if !strings.HasPrefix(contentType, "image/") {
+					contentType = http.DetectContentType(image)
+				}
+
+				if !strings.HasPrefix(contentType, "image/") {
+					countImage("not an image")
+					continue
+				}
+
+				countImage("saved")
+
+				downloaded[attribute.Val] = "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(image)
+			}
+
+			if downloaded[attribute.Val] != "" {
+				node.Attr[a].Val = downloaded[attribute.Val]
+			}
+		}
+	}
+
+	var rendered strings.Builder
+
+	err = html.Render(&rendered, document)
+
+	if err != nil {
+		return body
+	}
+
+	return rendered.String()
+}
+
+func imageReport(outcomes map[string]int) string {
+	var parts []string
+
+	for outcome, number := range outcomes {
+		parts = append(parts, fmt.Sprintf("%d %s", number, outcome))
+	}
+
+	slices.Sort(parts)
+
+	return strings.Join(parts, ", ")
 }

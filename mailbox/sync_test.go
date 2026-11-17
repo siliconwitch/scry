@@ -536,3 +536,135 @@ Rent statement attached.
 type discardLogger struct{}
 
 func (discardLogger) Printf(string, ...any) {}
+
+func TestSpamAndTrash(t *testing.T) {
+	user := imapmemserver.NewUser("me@example.com", "secret")
+
+	for _, name := range []string{"INBOX", "Sent", "Archive", "Junk", "Deleted"} {
+		user.Create(name, nil)
+	}
+
+	appendMessage := func(folder, raw string) {
+		_, err := user.Append(folder, strings.NewReader(strings.ReplaceAll(raw, "\n", "\r\n")), &imap.AppendOptions{Time: time.Now()})
+
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	appendMessage("Junk", "From: Prize Desk <win@example.com>\nSubject: You won\nContent-Type: text/html\n\n<p>Claim it</p><img src=\"http://127.0.0.1:9/pixel.png\">\n")
+	appendMessage("Deleted", "From: Corner Shop <receipts@example.org>\nSubject: Old receipt\nContent-Type: text/html\n\n<img src=\"http://127.0.0.1:9/logo.png\">\n")
+
+	server := imapserver.New(&imapserver.Options{
+		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+			return sentFolderSession{imapmemserver.NewUserSession(user)}, nil, nil
+		},
+		Caps:      imap.CapSet{imap.CapIMAP4rev1: {}, imap.CapUIDPlus: {}, imap.CapMove: {}},
+		TLSConfig: serverTLS,
+		Logger:    discardLogger{},
+	})
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go server.Serve(listener)
+	defer server.Close()
+
+	account := Account{Name: "Personal", Email: "me@example.com", IMAP: listener.Addr().String(), PasswordCommand: "echo secret"}
+	mail := New([]Account{account}, t.TempDir(), 365)
+
+	var reports []string
+
+	report := func(format string, arguments ...any) {
+		reports = append(reports, fmt.Sprintf(format, arguments...))
+		t.Logf(format, arguments...)
+	}
+
+	sync := func() error {
+		reports = nil
+		return mail.Sync(context.Background(), "Personal", report)
+	}
+
+	steps := []struct {
+		name        string
+		action      func() error
+		wantReports []string
+		wantFolders map[string]int
+	}{
+		{
+			name:        "nothing is fetched for Spam or Trash",
+			action:      sync,
+			wantReports: []string{"Spam: remote images: 1 skipped in Spam", "Trash: remote images: 1 skipped in Trash"},
+			wantFolders: map[string]int{Inbox: 0, Spam: 1, Trash: 1},
+		},
+		{
+			name: "an email moved out of Spam gets its images",
+			action: func() error {
+				err := mail.Move(mail.Folder("Personal", Spam)[0].ID, Inbox)
+
+				if err != nil {
+					return err
+				}
+
+				return sync()
+			},
+			wantReports: []string{"Spam: remote images in 1 emails moved out: 1 refused private address"},
+			wantFolders: map[string]int{Inbox: 1, Spam: 0, Trash: 1},
+		},
+		{
+			name: "emptying Trash also deletes an email still on its way there",
+			action: func() error {
+				err := mail.Move(mail.Folder("Personal", Inbox)[0].ID, Trash)
+
+				if err != nil {
+					return err
+				}
+
+				emptied := mail.EmptyTrash("Personal")
+
+				if emptied != 2 || len(mail.Folder("Personal", Trash)) != 0 || len(mail.All()) != 0 {
+					return fmt.Errorf("emptied %d, Trash holds %d, search sees %d", emptied, len(mail.Folder("Personal", Trash)), len(mail.All()))
+				}
+
+				return sync()
+			},
+			wantReports: []string{"Trash: deleted 2 for good, dropped 0 already deleted elsewhere"},
+			wantFolders: map[string]int{Inbox: 0, Spam: 0, Trash: 0},
+		},
+		{
+			name: "the server no longer holds them",
+			action: func() error {
+				mail = New([]Account{account}, t.TempDir(), 365)
+				return sync()
+			},
+			wantFolders: map[string]int{Inbox: 0, Spam: 0, Trash: 0},
+		},
+	}
+
+	for _, step := range steps {
+		t.Run(step.name, func(t *testing.T) {
+			err := step.action()
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for _, want := range step.wantReports {
+				if !slices.Contains(reports, want) {
+					t.Errorf("missing report %q", want)
+				}
+			}
+
+			for folder, want := range step.wantFolders {
+				got := len(mail.Folder("Personal", folder))
+
+				if got != want {
+					t.Errorf("%s holds %d, want %d", folder, got, want)
+				}
+			}
+		})
+	}
+}

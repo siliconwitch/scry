@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -45,6 +46,7 @@ const (
 	noPopup popup = iota
 	movePopup
 	discardPopup
+	emptyTrashPopup
 	logPopup
 )
 
@@ -153,7 +155,10 @@ var (
 	boldStyle = lipgloss.NewStyle().Bold(true)
 )
 
-var clickableKeys = []string{"A", "M", "!", "D", "r", "R", "n", "ctrl+r", "L", "q", "/", "e", "s", "h", "x", "u", "w", "y", "enter", "esc", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
+var clickableKeys = []string{"A", "M", "!", "D", "E", "r", "R", "n", "ctrl+r", "L", "q", "ctrl+c", "/", "e", "s", "h", "l", "x", "u", "w", "y", "enter", "esc", "j", "k", "down", "up", "pgdown", "pgup", "home", "end", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
+
+// How the footer writes key names that aren't a single character.
+var keyNames = map[string]string{"down": "↓", "up": "↑", "left": "←", "right": "→", "pgdown": "pgdn"}
 
 type Model struct {
 	options Options
@@ -772,6 +777,28 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 
 		return m, nil
 
+	case emptyTrashPopup:
+		switch key {
+		case "y":
+			m.popup = noPopup
+			account := m.folderRows[m.folderIndex].account
+			emptied := m.options.Mail.EmptyTrash(account)
+
+			m.options.Log.Write(account, "Emptied Trash: %d emails to delete for good", emptied)
+
+			m.messageIndex = -1
+			m.reload()
+
+			mail := m.options.Mail
+
+			return m, tea.Batch(m.showSelected(false), m.setNotice("Emptied Trash"), func() tea.Msg { return savedMsg{err: mail.Save()} }, m.requestSync(account))
+
+		case "n", "esc", "q":
+			m.popup = noPopup
+		}
+
+		return m, nil
+
 	case logPopup:
 		visibleLines := m.logRows()
 
@@ -953,7 +980,18 @@ func (m *Model) handleKey(key string) (tea.Model, tea.Cmd) {
 		return m, m.moveSelected(mailbox.Archive)
 
 	case "!":
+		if hasSelection && selected.Folder == mailbox.Spam {
+			return m, m.moveSelected(mailbox.Inbox)
+		}
+
 		return m, m.moveSelected(mailbox.Spam)
+
+	case "E":
+		row := m.folderRows[m.folderIndex]
+
+		if m.search.Value() == "" && row.account != "" && row.folder == mailbox.Trash && len(m.messages) > 0 {
+			m.popup = emptyTrashPopup
+		}
 
 	case "D":
 		if !hasSelection || selected.Folder != mailbox.Outbox {
@@ -1425,7 +1463,7 @@ func (m *Model) setNotice(text string) tea.Cmd {
 }
 
 func (m *Model) panesHeight() int {
-	return max(3, m.height-3)
+	return max(3, m.height-1-len(m.footer()))
 }
 
 func (m *Model) logRows() int {
@@ -1817,6 +1855,13 @@ func (m *Model) View() tea.View {
 
 		middle = overlay(middle, m.popupBox(lines, max(lipgloss.Width(question)+4, 34)))
 
+	case emptyTrashPopup:
+		row := m.folderRows[m.folderIndex]
+		question := fmt.Sprintf("Delete the %d emails in %s's Trash for good?", len(m.messages), row.account)
+		lines := []string{boldStyle.Render(question), "This can't be undone.", "", m.button("y", "delete for good") + "    " + m.button("n", "keep")}
+
+		middle = overlay(middle, m.popupBox(lines, max(lipgloss.Width(question)+4, 34)))
+
 	case logPopup:
 		boxWidth := min(m.width-8, 110)
 
@@ -1860,106 +1905,7 @@ func (m *Model) View() tea.View {
 		middle = overlay(middle, m.popupBox(lines, boxWidth))
 	}
 
-	var footerRows [][]string
-
-	switch {
-	case m.popup == movePopup:
-		footerRows = [][]string{{m.button("enter", "move"), m.button("esc", "cancel")}}
-
-	case m.popup == discardPopup:
-		footerRows = [][]string{{m.button("y", "discard"), m.button("n", "keep")}}
-
-	case m.popup == logPopup:
-		var buttons []string
-
-		for i, account := range m.accounts[:min(9, len(m.accounts))] {
-			key := strconv.Itoa(i + 1)
-			nameStyle := m.style(m.accountColor(account.Name)).Bold(account.Name == m.logFilter)
-
-			buttons = append(buttons, m.zones.Mark("key:"+key, m.style(mutedColor).Bold(true).Render(key)+" "+nameStyle.Render(account.Name)))
-		}
-
-		footerRows = [][]string{append(buttons, m.button("esc", "close"))}
-
-	case m.sending:
-		footerRows = [][]string{{m.button("u", "undo send")}}
-
-	case m.delivering:
-
-	case m.draftVisible:
-		footerRows = [][]string{{m.button("e", "edit"), m.button("s", "send"), m.button("h", "hide"), m.button("x", "discard")}}
-
-	case m.searchFocused:
-		footerRows = [][]string{{m.button("enter", "browse results"), m.button("esc", "clear search")}}
-
-	default:
-		deleteLabel := "delete"
-
-		selected, hasSelection := m.selected()
-
-		if hasSelection && selected.Folder == mailbox.Outbox {
-			deleteLabel = "back to draft"
-		}
-
-		footerRows = [][]string{
-			{
-				m.button("A", "archive"), m.button("M", "move"), m.button("!", "spam"), m.button("D", deleteLabel),
-				m.button("r", "reply all"), m.button("R", "reply"),
-			},
-			{
-				m.button("ctrl+r", "sync"), m.button("n", "new"), m.button("L", "log"), m.button("/", "search"),
-				m.button("y", "yank sender"), m.button("q", "quit"),
-			},
-		}
-	}
-
-	var columnWidths []int
-	for _, buttons := range footerRows {
-		for column, button := range buttons {
-			if column == len(columnWidths) {
-				columnWidths = append(columnWidths, 0)
-			}
-
-			columnWidths[column] = max(columnWidths[column], lipgloss.Width(button))
-		}
-	}
-
-	textWidth := 0
-	for _, columnWidth := range columnWidths {
-		textWidth += columnWidth
-	}
-
-	gaps := max(1, len(columnWidths)-1)
-	base, extra := 1, 0
-
-	spacing := m.width - 2 - textWidth
-
-	if spacing > gaps {
-		base, extra = spacing/gaps, spacing%gaps
-	}
-
-	footerLines := []string{"", ""}
-
-	for row, buttons := range footerRows {
-		var bar strings.Builder
-
-		for column, button := range buttons {
-			bar.WriteString(button)
-
-			if column < len(buttons)-1 {
-				gap := base
-				if column < extra {
-					gap++
-				}
-
-				bar.WriteString(strings.Repeat(" ", columnWidths[column]-lipgloss.Width(button)+gap))
-			}
-		}
-
-		footerLines[row] = " " + ansi.Truncate(bar.String(), m.width-2, "")
-	}
-
-	footer := strings.Join(footerLines, "\n")
+	footer := strings.Join(m.footer(), "\n")
 
 	view.SetContent(m.zones.Scan(lipgloss.JoinVertical(lipgloss.Left, topBar, middle, footer)))
 
@@ -1988,8 +1934,200 @@ func (m *Model) style(colour adaptiveColor) lipgloss.Style {
 	return lipgloss.NewStyle().Foreground(m.paint(colour))
 }
 
-func (m *Model) button(key, label string) string {
-	return m.zones.Mark("key:"+key, m.style(mutedColor).Bold(true).Render(key)+" "+m.style(mutedColor).Render(label))
+// keys lists a key and its aliases, such as "j/down". A click runs the first.
+func (m *Model) button(keys, label string) string {
+	aliases := []string{keys}
+
+	if keys != "/" {
+		aliases = strings.Split(keys, "/")
+	}
+
+	var shown []string
+
+	for _, key := range aliases {
+		shown = append(shown, cmp.Or(keyNames[key], key))
+	}
+
+	return m.zones.Mark("key:"+aliases[0], m.style(mutedColor).Bold(true).Render(strings.Join(shown, "/"))+" "+m.style(mutedColor).Render(label))
+}
+
+func (m *Model) footer() []string {
+	quit := m.button("q/ctrl+c", "quit")
+	scroll := []string{m.button("j/down", "down"), m.button("k/up", "up"), m.button("pgdown", "page down"), m.button("pgup", "page up"), m.button("home", "top"), m.button("end", "bottom")}
+
+	var accounts []string
+
+	for i, account := range m.accounts[:min(9, len(m.accounts))] {
+		key := strconv.Itoa(i + 1)
+		nameStyle := m.style(m.accountColor(account.Name)).Bold(m.popup == logPopup && account.Name == m.logFilter)
+
+		accounts = append(accounts, m.zones.Mark("key:"+key, m.style(mutedColor).Bold(true).Render(key)+" "+nameStyle.Render(account.Name)))
+	}
+
+	var buttons []string
+
+	switch {
+	case m.popup == movePopup:
+		buttons = []string{m.button("enter", "move"), m.button("j/down", "down"), m.button("k/up", "up"), m.button("esc/q", "cancel"), m.button("ctrl+c", "quit")}
+
+	case m.popup == discardPopup:
+		buttons = []string{m.button("y", "discard"), m.button("n/esc/q", "keep"), m.button("ctrl+c", "quit")}
+
+	case m.popup == emptyTrashPopup:
+		buttons = []string{m.button("y", "delete for good"), m.button("n/esc/q", "keep"), m.button("ctrl+c", "quit")}
+
+	case m.popup == logPopup:
+		buttons = slices.Concat(accounts, scroll, []string{m.button("esc/q/L", "close"), m.button("ctrl+c", "quit")})
+
+	case m.sending:
+		buttons = []string{m.button("u", "undo send"), m.button("ctrl+c", "quit")}
+
+	case m.delivering:
+		buttons = []string{m.button("ctrl+c", "quit")}
+
+	case m.searchFocused:
+		buttons = []string{m.button("enter/tab", "browse results"), m.button("down", "down"), m.button("up", "up"), m.button("esc", "clear search"), m.button("ctrl+c", "quit")}
+
+	case m.draftVisible:
+		buttons = []string{m.button("e", "edit")}
+
+		if m.draftError == "" {
+			buttons = append(buttons, m.button("s", "send"))
+		}
+
+		buttons = append(buttons, m.button("h", "hide"), m.button("x", "discard"))
+		buttons = slices.Concat(buttons, accounts, []string{m.button("ctrl+r", "sync"), m.button("n", "new"), m.button("/", "search"), m.button("L", "log"), quit})
+
+	default:
+		selected, hasSelection := m.selected()
+
+		if hasSelection {
+			movable := selected.Folder != mailbox.Outbox
+
+			if movable && selected.Folder != mailbox.Archive {
+				buttons = append(buttons, m.button("A", "archive"))
+			}
+
+			if movable {
+				buttons = append(buttons, m.button("M", "move"))
+			}
+
+			switch {
+			case selected.Folder == mailbox.Spam:
+				buttons = append(buttons, m.button("!", "not spam"))
+
+			case movable:
+				buttons = append(buttons, m.button("!", "spam"))
+			}
+
+			switch {
+			case selected.Folder == mailbox.Outbox:
+				buttons = append(buttons, m.button("D", "back to draft"))
+
+			case selected.Folder != mailbox.Trash:
+				buttons = append(buttons, m.button("D", "delete"))
+			}
+
+			buttons = append(buttons, m.button("r", "reply all"), m.button("R", "reply"), m.button("y", "yank sender"))
+		}
+
+		row := m.folderRows[m.folderIndex]
+
+		if m.search.Value() == "" && row.account != "" && row.folder == mailbox.Trash && len(m.messages) > 0 {
+			buttons = append(buttons, m.button("E", "empty trash"))
+		}
+
+		if m.focus == listPane {
+			buttons = append(buttons, m.button("h/left/tab", "sidebar"))
+		} else {
+			buttons = append(buttons, m.button("l/right/enter/tab", "email list"))
+		}
+
+		if m.focus == folderPane || len(m.messages) > 1 {
+			buttons = append(buttons, scroll...)
+		}
+
+		if m.search.Value() != "" {
+			buttons = append(buttons, m.button("esc", "clear search"))
+		}
+
+		buttons = slices.Concat(buttons, accounts, []string{m.button("ctrl+r", "sync"), m.button("n", "new"), m.button("/", "search"), m.button("L", "log")})
+
+		if m.draft != nil {
+			buttons = append(buttons, m.button("w", "draft"))
+		}
+
+		buttons = append(buttons, quit)
+	}
+
+	// Lay the buttons out in the most columns that fit, so none is cut off.
+	available := m.width - 2
+	columns := len(buttons)
+
+	var widths []int
+
+	for {
+		widths = make([]int, columns)
+
+		for i, button := range buttons {
+			widths[i%columns] = max(widths[i%columns], lipgloss.Width(button))
+		}
+
+		total := 2 * (columns - 1)
+
+		for _, width := range widths {
+			total += width
+		}
+
+		if total <= available || columns == 1 {
+			break
+		}
+
+		columns--
+	}
+
+	textWidth := 0
+	for _, width := range widths {
+		textWidth += width
+	}
+
+	gaps := max(1, columns-1)
+	base, extra := 2, 0
+
+	spacing := available - textWidth
+
+	if spacing > gaps*2 {
+		base, extra = spacing/gaps, spacing%gaps
+	}
+
+	var lines []string
+
+	for start := 0; start < len(buttons); start += columns {
+		row := buttons[start:min(len(buttons), start+columns)]
+
+		var bar strings.Builder
+
+		for column, button := range row {
+			bar.WriteString(button)
+
+			if column < len(row)-1 {
+				gap := base
+				if column < extra {
+					gap++
+				}
+
+				bar.WriteString(strings.Repeat(" ", widths[column]-lipgloss.Width(button)+gap))
+			}
+		}
+
+		lines = append(lines, " "+ansi.Truncate(bar.String(), available, ""))
+	}
+
+	for len(lines) < 2 {
+		lines = append(lines, "")
+	}
+
+	return lines
 }
 
 func (m *Model) popupBox(lines []string, width int) string {

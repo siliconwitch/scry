@@ -64,6 +64,10 @@ Never loosen any of these.
 - Email bodies are served with a CSP that blocks scripts and every network
   request, and sandboxes the document. Images come only from copies made at
   sync. Attachments are served as `application/octet-stream` downloads.
+- The served body drops `link`, `meta`, `base`, `iframe`, `frame`, `object`
+  and `embed`, because Chromium connects to their addresses despite the CSP
+  and the sandbox. Links point back to the viewer, which hands them to the
+  `links` command. Never give the body frame `allow-popups`.
 - Sync downloads every remote image in a new email, read or not, so a tracking
   image only confirms delivery.
 - Never fetch anything for Spam. Never send read receipts.
@@ -250,6 +254,18 @@ every Go module update until the hash is updated.
 
 5. Commit `flake.nix` to the pull request branch with the message
    `Updated the Nix vendor hash`, and push.
+
+### pdf.js
+
+`viewer/pdfjs` holds pdf.js from the `pdfjs-dist` npm package. Dependabot
+doesn't track it, so check its version in `viewer/pdfjs/package.json` against
+npm when Raj asks for dependency updates. To update it, download the release
+tarball, check it against the `integrity` hash npm lists, and copy in:
+
+- `build/pdf.min.mjs` and `build/pdf.worker.min.mjs`
+- `cmaps`, `iccs` and `standard_fonts`
+- from `wasm`, everything except the QuickJS files, which run scripts in PDFs
+- `LICENSE` and `package.json`
 
 ### A vulnerability
 

@@ -24,6 +24,7 @@ const version = "0.1.0"
 
 type config struct {
 	Viewer      string          `toml:"viewer"`
+	Links       string          `toml:"links"`
 	LogDays     int             `toml:"log-days"`
 	HistoryDays int             `toml:"history-days"`
 	Accounts    []accountConfig `toml:"account"`
@@ -79,6 +80,10 @@ func main() {
 
 	for _, key := range metadata.Undecoded() {
 		problems = append(problems, fmt.Sprintf("%s isn't a setting.", key))
+	}
+
+	if settings.Links != "" && !strings.Contains(settings.Links, "%s") {
+		problems = append(problems, `links needs %s where the address goes, such as "firefox %s".`)
 	}
 
 	if settings.LogDays < 1 {
@@ -187,7 +192,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	server, err := viewer.Start()
+	server, err := viewer.Start(settings.Links)
 
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "scry: starting the viewer:", err)

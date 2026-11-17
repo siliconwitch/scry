@@ -64,21 +64,114 @@ h1 {
   margin-top: 12px;
 }
 .attachments:empty { display: none; }
-.attachments a {
+.attachments a, .attachments button, .viewer-bar button, .viewer-bar a {
   padding: 5px 12px;
   border: 1px solid color-mix(in srgb, var(--surface) 40%, transparent);
   border-radius: 6px;
+  background: none;
   color: var(--surface);
+  font: inherit;
   text-decoration: none;
+  cursor: pointer;
 }
-.attachments a:hover { border-color: var(--surface); }
+.attachments a:hover, .attachments button:hover, .viewer-bar button:hover:not(:disabled), .viewer-bar a:hover { border-color: var(--surface); }
 .attachments span { color: color-mix(in srgb, var(--surface) 80%, transparent); margin-left: 6px; }
+.viewer-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.viewer-bar button, .viewer-bar a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+}
+.viewer-bar button:disabled { opacity: 0.4; cursor: default; }
+.viewer-bar svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.viewer-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.viewer-position { color: color-mix(in srgb, var(--surface) 80%, transparent); }
 iframe {
   flex: 1;
   width: 100%;
   border: 0;
   background: #ffffff;
 }
+.media {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 24px;
+}
+#image-view {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#image-view img { max-width: 100%; max-height: 100%; object-fit: contain; }
+#pdf-view {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+.pdf-page {
+  position: relative;
+  flex: none;
+  background: #ffffff;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 25%);
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
+}
+.pdf-page canvas { display: block; width: 100%; height: 100%; }
+.pdf-links { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
+.pdf-links a { position: absolute; pointer-events: auto; cursor: pointer; }
+.pdf-links a:hover { background: color-mix(in srgb, var(--accent) 15%, transparent); }
+/* The text layer from pdf.js's own viewer: invisible text over the page, so it can be selected. */
+.textLayer {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  line-height: 1;
+  text-align: initial;
+  letter-spacing: normal;
+  word-spacing: normal;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  z-index: 0;
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+.textLayer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  user-select: text;
+}
+.textLayer > :not(.markedContent), .textLayer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+.textLayer .markedContent { display: contents; }
+.textLayer span[role="img"] { user-select: none; cursor: default; }
+.textLayer ::selection { background: color-mix(in srgb, AccentColor, transparent 50%); color: transparent; }
+.textLayer br::selection { background: transparent; }
+#pdf-view p { color: var(--muted); }
 .state {
   flex: 1;
   display: flex;
@@ -113,7 +206,7 @@ iframe {
 <div class="state" id="state"><strong>scry</strong><span id="state-text">Select an email in scry</span></div>
 <header id="header" hidden>
   <h1 id="subject"></h1>
-  <div class="meta">
+  <div class="meta" id="meta">
     <span>From <b id="from"></b></span>
     <span>To <b id="to"></b></span>
     <span id="cc-row">Cc <b id="cc"></b></span>
@@ -121,8 +214,18 @@ iframe {
     <span id="date"></span>
   </div>
   <div class="attachments" id="attachments"></div>
+  <div class="viewer-bar" id="viewer-bar" hidden>
+    <button id="back" title="Back to the email"><svg viewBox="0 0 24 24"><path d="M19 12H5M11 6l-6 6 6 6"/></svg>Email</button>
+    <span class="viewer-name" id="viewer-name"></span>
+    <span class="viewer-position" id="viewer-position"></span>
+    <button id="previous" title="Previous attachment"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
+    <button id="next" title="Next attachment"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+    <a id="download" title="Download"><svg viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg></a>
+  </div>
 </header>
-<iframe id="body" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" hidden></iframe>
+<iframe id="body" sandbox="" referrerpolicy="no-referrer" hidden></iframe>
+<div class="media" id="image-view" hidden><img id="image" alt=""></div>
+<div class="media" id="pdf-view" hidden></div>
 <div class="toast" id="toast" hidden></div>
 <script src="app.js"></script>
 </body>
