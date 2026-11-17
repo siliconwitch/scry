@@ -79,6 +79,8 @@ Everything you can see and do in scry. Anything not listed here is out.
 - Choosing a folder selects its first email. From the sidebar, that email
   stays unread until you move to the email list. The number keys focus the
   email list, so they mark it read.
+- scry opens with the email list focused on the combined Inbox. Once the
+  mirror opens, its first email is selected and marked read.
 - The config can name a browser command that opens the viewer at startup, such
   as `chromium --app=%s`. The sync log view shows the viewer's address for any
   browser.
@@ -172,8 +174,20 @@ Everything you can see and do in scry. Anything not listed here is out.
 
 - Every action in the terminal has a keybind and a mouse equivalent. The
   viewer is mouse only.
-- The footer shows, as buttons, every key that works in the current view, and
-  no others. It wraps onto more rows when the window is narrow.
+- The footer shows, as buttons, the essential keys that work in the current
+  view, and no others.
+  - In the email list: reply, reply all, archive, delete, empty Trash, new,
+    return to the draft, search, clear search and quit.
+  - In the draft: edit, send, discard, hide and quit.
+  - In the sync log: the account filters, close and quit.
+  - Every other view shows all of its keys.
+- `?` shows every key that works in the current view. `?` again shows only the
+  essential keys.
+- The footer orders keys from the selected email outwards: actions on the
+  email, then writing, then finding mail, then sync, log and quit.
+- The number keys show as one button, such as `1-3 jump to inbox`.
+- The footer keeps wide gaps between buttons, and wraps onto more rows when
+  they don't fit.
 - `j` and `k`, Up and Down, Page Up, Page Down, Home and End move through a
   list.
 - Tab switches between the sidebar and the email list. `h` or Left focuses
