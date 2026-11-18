@@ -176,6 +176,19 @@ Everything you can see and do in scry. Anything not listed here is out.
 - In the log, an account's number key shows only that account's lines. The
   same key again shows every account.
 
+### Notifications
+
+- An unread email that reaches an Inbox gets a notification while you're at
+  the machine.
+- Only email that reached the server moments ago gets one, so mail that
+  arrived while scry was closed or the machine slept stays quiet.
+- Email read on another device first, and email in any other folder, gets
+  none.
+- The `notify` command in the config shows the notification, such as
+  `notify-send -a scry "%s | %s" "%s"`. Its first, second and third `%s` are
+  the sender, the subject and the start of the email's text.
+- Without `notify`, scry shows no notifications.
+
 ### Keyboard and mouse
 
 - Every action in the terminal has a keybind and a mouse equivalent. The
@@ -279,6 +292,7 @@ Everything scry does that you don't see or drive directly.
 ```toml
 viewer = "chromium --app=%s"
 links = "firefox %s"
+notify = 'notify-send -a scry "%s | %s" "%s"'
 log-days = 7
 history-days = 365
 

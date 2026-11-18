@@ -107,6 +107,7 @@ packages install a copy under `share/doc/scry/`.
 ```toml
 viewer = "chromium --app=%s"
 links = "firefox %s"
+notify = 'notify-send -a scry "%s | %s" "%s"'
 
 [[account]]
 name = "Personal"
@@ -131,6 +132,7 @@ folders = ["Events", "Reference"]
 | -------------- | ------- | ----------------------------------------------------------------------- |
 | `viewer`       |         | Browser command that opens the viewer. `%s` is the viewer's address.    |
 | `links`        |         | Browser command that opens a link clicked in an email. `%s` is the link. |
+| `notify`       |         | Command that shows a notification for a new email. Its first, second and third `%s` are the sender, the subject and the start of the text. |
 | `log-days`     | `7`     | Days to keep sync logs                                                  |
 | `history-days` | `365`   | Days of Archive and Sent to keep on this machine. Older mail stays on the server. |
 
@@ -152,9 +154,19 @@ The viewer never opens links itself, so it never reaches the network. Set
 `links` to send them to another browser. `firefox %s` opens each link as a tab
 in a running Firefox, or in a new window.
 
-scry splits `viewer`, `links` and `password-cmd` into arguments the way a shell
-does, so quotes keep spaces inside one argument. It runs each command without
-a shell, so `$HOME`, `~` and `$(…)` stay as written.
+scry runs `notify` once for each unread email that reaches an Inbox within two
+minutes of the server receiving it.
+
+scry splits `viewer`, `links`, `notify` and `password-cmd` into arguments the
+way a shell does, so quotes keep spaces inside one argument. It runs each
+command without a shell, so `$HOME`, `~` and `$(…)` stay as written. To add
+logic, run `sh -c`. Pass the values as arguments and read them as `$1`, `$2`
+and `$3`, so email text never reaches the shell as code. For example, this
+skips notifications while the screen is locked:
+
+```toml
+notify = '''sh -c 'loginctl show-session "$XDG_SESSION_ID" -p LockedHint | grep -q yes || notify-send -a scry "$1" "$2"' scry "%s" "%s"'''
+```
 
 ### Accounts
 

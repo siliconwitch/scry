@@ -31,6 +31,7 @@ type Options struct {
 	Log          *synclog.Log
 	LogDirectory string
 	StartNotice  string
+	Notify       []string
 }
 
 type pane int
@@ -57,6 +58,7 @@ type folderRow struct {
 
 type syncDoneMsg struct {
 	account string
+	arrived []mailbox.Message
 	err     error
 }
 
@@ -418,6 +420,54 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.reload()
 
 		cmds := []tea.Cmd{m.showSelected(false)}
+
+		if len(m.options.Notify) > 0 && len(msg.arrived) > 0 {
+			m.options.Log.Write(msg.account, "New Inbox emails to notify: %d", len(msg.arrived))
+
+			for _, message := range msg.arrived {
+				subject := message.Subject
+
+				if subject == "" {
+					subject = "(no subject)"
+				}
+
+				preview := ansi.Truncate(strings.Join(strings.Fields(message.Text), " "), 200, "…")
+				values := []string{message.From.Short(), subject, preview}
+
+				var arguments []string
+				next := 0
+
+				for _, word := range m.options.Notify {
+					parts := strings.Split(word, "%s")
+					argument := parts[0]
+
+					for _, part := range parts[1:] {
+						value := ""
+						if next < len(values) {
+							value = values[next]
+						}
+
+						next++
+						argument += value + part
+					}
+
+					arguments = append(arguments, argument)
+				}
+
+				log := m.options.Log
+				account := msg.account
+
+				cmds = append(cmds, func() tea.Msg {
+					err := exec.Command(arguments[0], arguments[1:]...).Run()
+
+					if err != nil {
+						log.Write(account, "Notify failed: %v", err)
+					}
+
+					return nil
+				})
+			}
+		}
 
 		unlocked := m.options.Mail.Unlocked(msg.account)
 
@@ -1428,9 +1478,9 @@ func (m *Model) requestSync(account string) tea.Cmd {
 	sync := func() tea.Msg {
 		defer cancel()
 
-		err := mail.Sync(ctx, account, func(format string, arguments ...any) { log.Write(account, format, arguments...) })
+		arrived, err := mail.Sync(ctx, account, func(format string, arguments ...any) { log.Write(account, format, arguments...) })
 
-		return syncDoneMsg{account: account, err: err}
+		return syncDoneMsg{account: account, arrived: arrived, err: err}
 	}
 
 	return tea.Batch(sync, progressTick)

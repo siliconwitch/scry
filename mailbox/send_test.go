@@ -355,7 +355,7 @@ func TestSend(t *testing.T) {
 				return
 			}
 
-			err = box.Sync(context.Background(), account.Name, t.Logf)
+			_, err = box.Sync(context.Background(), account.Name, t.Logf)
 
 			switch {
 			case test.wantErr == "" && err != nil:

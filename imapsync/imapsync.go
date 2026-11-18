@@ -49,6 +49,7 @@ type Fetched struct {
 	Bcc         []Address
 	Subject     string
 	Date        time.Time
+	Received    time.Time
 	MessageID   string
 	References  []string
 	Text        string
@@ -473,7 +474,7 @@ func (s *Session) Fetch(uids []uint32, deliver func([]Fetched) error) error {
 		var fetchedBatch []Fetched
 
 		for _, item := range messages {
-			fetched := Fetched{UID: uint32(item.UID), Seen: slices.Contains(item.Flags, imap.FlagSeen)}
+			fetched := Fetched{UID: uint32(item.UID), Seen: slices.Contains(item.Flags, imap.FlagSeen), Received: item.InternalDate}
 
 			reader, err := mail.CreateReader(bytes.NewReader(item.FindBodySection(section)))
 

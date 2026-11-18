@@ -404,11 +404,11 @@ func (b *Mailbox) SyncProgress(account string) (done, total int) {
 	return count.done, count.total
 }
 
-func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(format string, arguments ...any)) error {
+func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(format string, arguments ...any)) ([]Message, error) {
 	account, ok := b.Account(accountName)
 
 	if !ok {
-		return fmt.Errorf("no account called %s", accountName)
+		return nil, fmt.Errorf("no account called %s", accountName)
 	}
 
 	b.mutex.Lock()
@@ -418,7 +418,7 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 
 	if opened == nil {
 		if len(account.PasswordCommand) == 0 {
-			return errors.New("the config has no password-cmd")
+			return nil, errors.New("the config has no password-cmd")
 		}
 
 		report("Running password-cmd")
@@ -426,14 +426,14 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 		output, err := exec.CommandContext(ctx, account.PasswordCommand[0], account.PasswordCommand[1:]...).Output()
 
 		if err != nil {
-			return errors.New("couldn't get the password. Unlock your password store and press Ctrl+R")
+			return nil, errors.New("couldn't get the password. Unlock your password store and press Ctrl+R")
 		}
 
 		firstLine, _, _ := strings.Cut(string(output), "\n")
 		password := strings.TrimSuffix(firstLine, "\r")
 
 		if password == "" {
-			return errors.New("password-cmd printed no password")
+			return nil, errors.New("password-cmd printed no password")
 		}
 
 		directory := filepath.Join(b.mirrorDirectory, fmt.Sprintf("%x", sha256.Sum256([]byte(account.Email)))[:16])
@@ -446,7 +446,7 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 			session, loginErr := imapsync.Dial(ctx, account.IMAP, account.Email, password)
 
 			if loginErr != nil {
-				return fmt.Errorf("the password opens neither the mirror nor the server: %w", loginErr)
+				return nil, fmt.Errorf("the password opens neither the mirror nor the server: %w", loginErr)
 			}
 
 			session.Close()
@@ -456,14 +456,14 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 			err = mirror.Wipe(directory)
 
 			if err != nil {
-				return err
+				return nil, err
 			}
 
 			store, err = mirror.Open(directory, []byte(password))
 		}
 
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		index := accountIndex{}
@@ -475,13 +475,13 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 			report("The mirror has no index yet, so this is a fresh mirror")
 
 		case err != nil:
-			return err
+			return nil, err
 
 		default:
 			err = gob.NewDecoder(bytes.NewReader(content)).Decode(&index)
 
 			if err != nil {
-				return fmt.Errorf("reading the mirror index: %w", err)
+				return nil, fmt.Errorf("reading the mirror index: %w", err)
 			}
 
 			report("Opened the mirror: %d emails and %d pending reads", len(index.Messages), len(index.PendingReads))
@@ -513,7 +513,7 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 	session, err := imapsync.Dial(ctx, account.IMAP, account.Email, opened.password)
 
 	if err != nil {
-		return fmt.Errorf("logging in: %w", err)
+		return nil, fmt.Errorf("logging in: %w", err)
 	}
 
 	defer session.Close()
@@ -523,7 +523,7 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 	serverFolders, err := session.Folders()
 
 	if err != nil {
-		return fmt.Errorf("listing folders: %w", err)
+		return nil, fmt.Errorf("listing folders: %w", err)
 	}
 
 	var failures []error
@@ -1382,6 +1382,8 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 
 	lastSaved := time.Now()
 
+	var arrived []Message
+
 	for _, planned := range planned {
 		folder := planned.folder
 		uidValidity := planned.uidValidity
@@ -1511,6 +1513,13 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 			count := b.progress[account.Name]
 			count.done += len(messages)
 			b.progress[account.Name] = count
+
+			for i, fetched := range batch {
+				if folder == Inbox && !fetched.Seen && time.Since(fetched.Received) < 2*time.Minute {
+					arrived = append(arrived, messages[i])
+				}
+			}
+
 			b.mutex.Unlock()
 
 			report("%s: saved %d emails, %d of %d this sync", folder, len(messages), count.done, count.total)
@@ -1547,7 +1556,7 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 		failures = append(failures, err)
 	}
 
-	return errors.Join(failures...)
+	return arrived, errors.Join(failures...)
 }
 
 func (b *Mailbox) Unqueue(id string) (Draft, error) {

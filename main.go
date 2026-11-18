@@ -26,6 +26,7 @@ const version = "0.2.0"
 type config struct {
 	Viewer      string          `toml:"viewer"`
 	Links       string          `toml:"links"`
+	Notify      string          `toml:"notify"`
 	LogDays     int             `toml:"log-days"`
 	HistoryDays int             `toml:"history-days"`
 	Accounts    []accountConfig `toml:"account"`
@@ -108,6 +109,7 @@ func main() {
 
 	viewerCommand := command("viewer", settings.Viewer)
 	linkCommand := command("links", settings.Links)
+	notifyCommand := command("notify", settings.Notify)
 
 	if len(settings.Accounts) == 0 {
 		problems = append(problems, "There are no [[account]] blocks.")
@@ -284,6 +286,7 @@ func main() {
 		Log:          log,
 		LogDirectory: logDirectory,
 		StartNotice:  startNotice,
+		Notify:       notifyCommand,
 	})
 
 	program := tea.NewProgram(root)

@@ -99,7 +99,7 @@ Content-Type: text/plain; charset=utf-8
 Meet at the bridge car park.
 `)
 
-	appendMessage("INBOX", now.Add(-time.Hour), []imap.Flag{imap.FlagSeen}, `From: Northline Rail <tickets@example.com>
+	appendMessage("INBOX", now, []imap.Flag{imap.FlagSeen}, `From: Northline Rail <tickets@example.com>
 To: me@example.com
 Subject: Your tickets
 Date: `+now.Add(-time.Hour).Format(time.RFC1123Z)+`
@@ -168,6 +168,14 @@ See you there.
 		t.Logf(format, arguments...)
 	}
 
+	var arrived []Message
+
+	sync := func(report func(format string, arguments ...any)) error {
+		var err error
+		arrived, err = mail.Sync(context.Background(), "Personal", report)
+		return err
+	}
+
 	subjects := func(box *Mailbox, folder string) string {
 		var found []string
 
@@ -184,15 +192,17 @@ See you there.
 	}
 
 	steps := []struct {
-		name    string
-		action  func() error
-		wantErr string
-		check   func(t *testing.T)
+		name        string
+		action      func() error
+		wantErr     string
+		wantArrived string
+		check       func(t *testing.T)
 	}{
 		{
-			name:    "first sync",
-			action:  func() error { return mail.Sync(context.Background(), "Personal", t.Logf) },
-			wantErr: "the server has no Sent folder",
+			name:        "first sync",
+			action:      func() error { return sync(t.Logf) },
+			wantErr:     "the server has no Sent folder",
+			wantArrived: "Saturday walk?",
 			check: func(t *testing.T) {
 				expected := map[string]string{
 					Inbox:    "*Saturday walk?, Your tickets",
@@ -246,7 +256,7 @@ See you there.
 			name: "read locally reaches the server",
 			action: func() error {
 				mail.MarkRead(mail.Folder("Personal", Inbox)[0].ID)
-				return mail.Sync(context.Background(), "Personal", t.Logf)
+				return sync(t.Logf)
 			},
 			wantErr: "the server has no Sent folder",
 			check: func(t *testing.T) {
@@ -278,7 +288,7 @@ See you there.
 				client.Store(imap.SeqSetNum(2), &imap.StoreFlags{Op: imap.StoreFlagsAdd, Flags: []imap.Flag{imap.FlagDeleted}}, nil).Close()
 				client.Expunge().Close()
 
-				return mail.Sync(context.Background(), "Personal", t.Logf)
+				return sync(t.Logf)
 			},
 			wantErr: "the server has no Sent folder",
 			check: func(t *testing.T) {
@@ -308,7 +318,11 @@ Content-Type: text/plain
 Rent statement attached.
 `)
 
-				mail.Sync(context.Background(), "Personal", t.Logf)
+				sync(t.Logf)
+
+				if len(arrived) > 0 {
+					return fmt.Errorf("an email received two months ago arrived: %q", arrived[0].Subject)
+				}
 
 				quarterly := mail.Folder("Personal", Inbox)[1]
 
@@ -334,7 +348,7 @@ Rent statement attached.
 					t.Errorf("restarted mailbox opened before sync: %q", got)
 				}
 
-				return mail.Sync(context.Background(), "Personal", report)
+				return sync(report)
 			},
 			wantErr: "the server has no Sent folder",
 			check: func(t *testing.T) {
@@ -385,7 +399,7 @@ Rent statement attached.
 
 				reports = nil
 
-				return mail.Sync(context.Background(), "Personal", report)
+				return sync(report)
 			},
 			wantErr: "the server has no Sent folder",
 			check: func(t *testing.T) {
@@ -460,7 +474,7 @@ Rent statement attached.
 
 				reports = nil
 
-				return mail.Sync(context.Background(), "Personal", report)
+				return sync(report)
 			},
 			wantErr: "the server has no Sent folder",
 			check: func(t *testing.T) {
@@ -481,7 +495,7 @@ Rent statement attached.
 				server.Close()
 
 				restarted := New([]Account{account}, mirrorDirectory, 365)
-				err := restarted.Sync(context.Background(), "Personal", t.Logf)
+				_, err := restarted.Sync(context.Background(), "Personal", t.Logf)
 
 				mail = restarted
 
@@ -508,7 +522,9 @@ Rent statement attached.
 				locked := account
 				locked.PasswordCommand = []string{"false"}
 
-				return New([]Account{locked}, t.TempDir(), 365).Sync(context.Background(), "Personal", t.Logf)
+				_, err := New([]Account{locked}, t.TempDir(), 365).Sync(context.Background(), "Personal", t.Logf)
+
+				return err
 			},
 			wantErr: "couldn't get the password",
 		},
@@ -516,6 +532,7 @@ Rent statement attached.
 
 	for _, step := range steps {
 		t.Run(step.name, func(t *testing.T) {
+			arrived = nil
 			err := step.action()
 
 			switch {
@@ -524,6 +541,16 @@ Rent statement attached.
 
 			case step.wantErr != "" && (err == nil || !strings.Contains(err.Error(), step.wantErr)):
 				t.Fatalf("got error %v, want one containing %q", err, step.wantErr)
+			}
+
+			var arrivedSubjects []string
+
+			for _, message := range arrived {
+				arrivedSubjects = append(arrivedSubjects, message.Subject)
+			}
+
+			if got := strings.Join(arrivedSubjects, ", "); got != step.wantArrived {
+				t.Errorf("arrived: got %q, want %q", got, step.wantArrived)
 			}
 
 			if step.check != nil {
@@ -585,7 +612,8 @@ func TestSpamAndTrash(t *testing.T) {
 
 	sync := func() error {
 		reports = nil
-		return mail.Sync(context.Background(), "Personal", report)
+		_, err := mail.Sync(context.Background(), "Personal", report)
+		return err
 	}
 
 	steps := []struct {
