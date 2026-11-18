@@ -163,7 +163,7 @@ func TestSend(t *testing.T) {
 	os.WriteFile(attachmentPath, []byte("Bring boots."), 0o600)
 	os.WriteFile(imagePath, []byte("fake png"), 0o600)
 
-	account := Account{Name: "Personal", DisplayName: "Kit Hale", Email: "me@example.com", IMAP: imapListener.Addr().String(), SMTP: listener.Addr().String(), Signature: signaturePath, PasswordCommand: "echo secret"}
+	account := Account{Name: "Personal", DisplayName: "Kit Hale", Email: "me@example.com", IMAP: imapListener.Addr().String(), SMTP: listener.Addr().String(), Signature: signaturePath, PasswordCommand: []string{"echo", "secret"}}
 
 	cases := []struct {
 		name         string

@@ -11,6 +11,7 @@ require (
 	github.com/emersion/go-imap/v2 v2.0.0-beta.9
 	github.com/emersion/go-message v0.18.2
 	github.com/lrstanley/bubblezone/v2 v2.0.1
+	github.com/mattn/go-shellwords v1.0.16
 	github.com/yuin/goldmark v1.8.7
 	golang.org/x/crypto v0.59.0
 	golang.org/x/net v0.62.0

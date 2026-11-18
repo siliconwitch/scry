@@ -99,7 +99,7 @@ type Account struct {
 	IMAP                  string
 	SMTP                  string
 	Signature             string
-	PasswordCommand       string
+	PasswordCommand       []string
 	Folders               []string
 	HideFromCombinedInbox bool
 }
@@ -417,15 +417,13 @@ func (b *Mailbox) Sync(ctx context.Context, accountName string, report func(form
 	b.mutex.Unlock()
 
 	if opened == nil {
-		words := strings.Fields(account.PasswordCommand)
-
-		if len(words) == 0 {
+		if len(account.PasswordCommand) == 0 {
 			return errors.New("the config has no password-cmd")
 		}
 
 		report("Running password-cmd")
 
-		output, err := exec.CommandContext(ctx, words[0], words[1:]...).Output()
+		output, err := exec.CommandContext(ctx, account.PasswordCommand[0], account.PasswordCommand[1:]...).Output()
 
 		if err != nil {
 			return errors.New("couldn't get the password. Unlock your password store and press Ctrl+R")

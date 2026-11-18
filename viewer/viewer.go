@@ -71,10 +71,10 @@ type Server struct {
 	done         chan struct{}
 	listener     net.Listener
 	token        string
-	linkCommand  string
+	linkCommand  []string
 }
 
-func Start(linkCommand string) (*Server, error) {
+func Start(linkCommand []string) (*Server, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 
 	if err != nil {
@@ -569,15 +569,15 @@ func (s *Server) openLink(link string) {
 		return
 	}
 
-	words := strings.Fields(s.linkCommand)
-
-	if len(words) == 0 {
+	if len(s.linkCommand) == 0 {
 		s.notice(`Set links in the config, such as links = "firefox %s", to open links.`)
 		return
 	}
 
-	for i := range words {
-		words[i] = strings.ReplaceAll(words[i], "%s", address.String())
+	var words []string
+
+	for _, word := range s.linkCommand {
+		words = append(words, strings.ReplaceAll(word, "%s", address.String()))
 	}
 
 	browser := exec.Command(words[0], words[1:]...)

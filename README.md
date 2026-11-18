@@ -152,6 +152,10 @@ The viewer never opens links itself, so it never reaches the network. Set
 `links` to send them to another browser. `firefox %s` opens each link as a tab
 in a running Firefox, or in a new window.
 
+scry splits `viewer`, `links` and `password-cmd` into arguments the way a shell
+does, so quotes keep spaces inside one argument. It runs each command without
+a shell, so `$HOME`, `~` and `$(…)` stay as written.
+
 ### Accounts
 
 Add one `[[account]]` block per email address. Their order sets each account's

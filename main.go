@@ -13,6 +13,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/BurntSushi/toml"
+	"github.com/mattn/go-shellwords"
 
 	"github.com/siliconwitch/scry/mailbox"
 	"github.com/siliconwitch/scry/synclog"
@@ -95,6 +96,19 @@ func main() {
 		problems = append(problems, "history-days must be at least 1.")
 	}
 
+	command := func(key, value string) []string {
+		words, err := shellwords.Parse(value)
+
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s isn't a valid command. Check its quotes.", key))
+		}
+
+		return words
+	}
+
+	viewerCommand := command("viewer", settings.Viewer)
+	linkCommand := command("links", settings.Links)
+
 	if len(settings.Accounts) == 0 {
 		problems = append(problems, "There are no [[account]] blocks.")
 	}
@@ -165,7 +179,7 @@ func main() {
 			signature = filepath.Join(home, rest)
 		}
 
-		accounts = append(accounts, mailbox.Account{Name: account.Name, DisplayName: account.DisplayName, Email: account.Email, IMAP: account.IMAP, SMTP: account.SMTP, Signature: signature, PasswordCommand: account.PasswordCommand, Folders: account.Folders, HideFromCombinedInbox: account.CombinedInbox != nil && !*account.CombinedInbox})
+		accounts = append(accounts, mailbox.Account{Name: account.Name, DisplayName: account.DisplayName, Email: account.Email, IMAP: account.IMAP, SMTP: account.SMTP, Signature: signature, PasswordCommand: command(fmt.Sprintf("Account %d: password-cmd", number), account.PasswordCommand), Folders: account.Folders, HideFromCombinedInbox: account.CombinedInbox != nil && !*account.CombinedInbox})
 	}
 
 	if len(problems) > 0 {
@@ -193,7 +207,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	server, err := viewer.Start(settings.Links)
+	server, err := viewer.Start(linkCommand)
 
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "scry: starting the viewer:", err)
@@ -242,7 +256,11 @@ func main() {
 
 	startNotice := ""
 
-	words := strings.Fields(strings.ReplaceAll(settings.Viewer, "%s", server.URL()))
+	var words []string
+
+	for _, word := range viewerCommand {
+		words = append(words, strings.ReplaceAll(word, "%s", server.URL()))
+	}
 
 	if len(words) == 0 {
 		startNotice = "No viewer command set. Press L for the viewer's address."

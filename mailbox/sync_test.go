@@ -157,7 +157,7 @@ See you there.
 	go server.Serve(listener)
 	defer server.Close()
 
-	account := Account{Name: "Personal", Email: "me@example.com", IMAP: listener.Addr().String(), PasswordCommand: "echo secret", Folders: []string{"Events"}}
+	account := Account{Name: "Personal", Email: "me@example.com", IMAP: listener.Addr().String(), PasswordCommand: []string{"echo", "secret"}, Folders: []string{"Events"}}
 	mirrorDirectory := t.TempDir()
 	mail := New([]Account{account}, mirrorDirectory, 365)
 
@@ -506,7 +506,7 @@ Rent statement attached.
 			name: "locked password store",
 			action: func() error {
 				locked := account
-				locked.PasswordCommand = "false"
+				locked.PasswordCommand = []string{"false"}
 
 				return New([]Account{locked}, t.TempDir(), 365).Sync(context.Background(), "Personal", t.Logf)
 			},
@@ -573,7 +573,7 @@ func TestSpamAndTrash(t *testing.T) {
 	go server.Serve(listener)
 	defer server.Close()
 
-	account := Account{Name: "Personal", Email: "me@example.com", IMAP: listener.Addr().String(), PasswordCommand: "echo secret"}
+	account := Account{Name: "Personal", Email: "me@example.com", IMAP: listener.Addr().String(), PasswordCommand: []string{"echo", "secret"}}
 	mail := New([]Account{account}, t.TempDir(), 365)
 
 	var reports []string
