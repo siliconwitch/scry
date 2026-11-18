@@ -137,6 +137,17 @@ folders = ["Events", "Reference"]
 Leave out `viewer` and press `L` in scry to see the viewer's address. Open it
 in any browser.
 
+While scry runs, it keeps the viewer's address in
+`$XDG_RUNTIME_DIR/scry/viewer` and deletes the file when it quits. A script can
+reopen a closed viewer from it:
+
+```sh
+chromium --app="$(cat "$XDG_RUNTIME_DIR/scry/viewer")"
+```
+
+The address includes the viewer's secret token, so the file has mode `0600`.
+scry writes no file when `XDG_RUNTIME_DIR` is unset.
+
 The viewer never opens links itself, so it never reaches the network. Set
 `links` to send them to another browser. `firefox %s` opens each link as a tab
 in a running Firefox, or in a new window.

@@ -98,7 +98,7 @@ func Start(linkCommand string) (*Server, error) {
 }
 
 func (s *Server) URL() string {
-	return "http://" + s.listener.Addr().String() + "/" + s.token + "/"
+	return "http://" + s.listener.Addr().String() + "/scry/" + s.token + "/"
 }
 
 func (s *Server) Show(page Page) {
@@ -131,7 +131,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	path, ok := strings.CutPrefix(r.URL.Path, "/"+s.token+"/")
+	path, ok := strings.CutPrefix(r.URL.Path, "/scry/"+s.token+"/")
 
 	if !ok {
 		http.NotFound(w, r)
@@ -326,7 +326,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			node.Attr = append(node.Attr, html.Attribute{Key: "href", Val: fmt.Sprintf("/%s/link/%d/%d", s.token, version, len(links))})
+			node.Attr = append(node.Attr, html.Attribute{Key: "href", Val: fmt.Sprintf("/scry/%s/link/%d/%d", s.token, version, len(links))})
 			links = append(links, address.String())
 		}
 
@@ -466,7 +466,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 					// The open path answers with no content, which keeps the file in its frame.
 					node.Attr = append(node.Attr,
-						html.Attribute{Key: "href", Val: "/" + s.token + "/open?url=" + url.QueryEscape(address.String())},
+						html.Attribute{Key: "href", Val: "/scry/" + s.token + "/open?url=" + url.QueryEscape(address.String())},
 						html.Attribute{Key: "title", Val: address.String()})
 				}
 

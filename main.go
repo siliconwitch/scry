@@ -202,6 +202,44 @@ func main() {
 
 	defer server.Close()
 
+	viewerFile := ""
+	runtimeDirectory := os.Getenv("XDG_RUNTIME_DIR")
+
+	if runtimeDirectory != "" {
+		viewerFile = filepath.Join(runtimeDirectory, "scry", "viewer")
+
+		err := os.MkdirAll(filepath.Dir(viewerFile), 0o700)
+
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "scry: writing the viewer address:", err)
+			os.Exit(1)
+		}
+
+		temporary, err := os.CreateTemp(filepath.Dir(viewerFile), "viewer-*")
+
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "scry: writing the viewer address:", err)
+			os.Exit(1)
+		}
+
+		_, err = temporary.WriteString(server.URL())
+		closeErr := temporary.Close()
+
+		if err == nil {
+			err = closeErr
+		}
+
+		if err == nil {
+			err = os.Rename(temporary.Name(), viewerFile)
+		}
+
+		if err != nil {
+			os.Remove(temporary.Name())
+			fmt.Fprintln(os.Stderr, "scry: writing the viewer address:", err)
+			os.Exit(1)
+		}
+	}
+
 	startNotice := ""
 
 	words := strings.Fields(strings.ReplaceAll(settings.Viewer, "%s", server.URL()))
@@ -233,6 +271,10 @@ func main() {
 	program := tea.NewProgram(root)
 
 	_, err = program.Run()
+
+	if viewerFile != "" {
+		os.Remove(viewerFile)
+	}
 
 	saveErr := mail.Save()
 

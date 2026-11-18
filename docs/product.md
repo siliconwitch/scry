@@ -82,6 +82,8 @@ Everything you can see and do in scry. Anything not listed here is out.
 - The config can name a browser command that opens the viewer at startup, such
   as `chromium --app=%s`. The sync log view shows the viewer's address for any
   browser.
+- While scry runs, `$XDG_RUNTIME_DIR/scry/viewer` holds the viewer's address,
+  so a script can reopen a closed viewer. scry deletes the file when it quits.
 - The viewer window closes when scry quits.
 - The viewer header shows the sender and the To, Cc and Bcc recipients. Bcc
   shows when the email carries one, which is normally only email you sent.
@@ -225,7 +227,8 @@ Everything scry does that you don't see or drive directly.
 - scry never fetches an image from a private or local network address.
 - scry never sends read receipts.
 - Only this machine can reach the viewer, and its address includes a secret
-  token.
+  token. Only your user can read the file that holds the address, which has
+  mode `0600`.
 - Scripts in email never run. The viewer shows images from the mirror and
   never contacts the network.
 - The viewer never opens a link itself. Links go to the `links` browser.
