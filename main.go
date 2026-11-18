@@ -20,7 +20,7 @@ import (
 	"github.com/siliconwitch/scry/viewer"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 type config struct {
 	Viewer      string          `toml:"viewer"`
