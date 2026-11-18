@@ -263,7 +263,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.search.SetWidth(min(48, m.width/2) - 3)
 		m.clampList()
-		return m, nil
+
+		// Bubble Tea sends these only when the view changes them, so a
+		// terminal that attaches through dtach never receives them.
+		modes := ansi.ResetModeTextCursorEnable +
+			ansi.SetModeAltScreen +
+			ansi.SetModeMouseButtonEvent + ansi.SetModeMouseExtSgr +
+			ansi.SetModifyOtherKeys2 + ansi.KittyKeyboard(1, 1)
+		return m, tea.Sequence(tea.Raw(modes), tea.ClearScreen)
 
 	case tea.KeyPressMsg:
 		if !m.searchFocused || m.popup != noPopup {
