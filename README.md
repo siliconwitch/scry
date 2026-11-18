@@ -4,6 +4,11 @@ A terminal email client that keeps every account in one place. You browse,
 file and write mail in the terminal. The selected email renders in a browser
 window beside it.
 
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/demo-light.gif">
+  <img alt="scry's unified inbox in a terminal, with the selected email and then a PDF attachment open in a browser window beside it" src="docs/demo.gif">
+</picture>
+
 - One unified inbox. Each account keeps its own folders, archive, spam and
   trash.
 - An encrypted mirror of every account on your machine, so reading, filing and
